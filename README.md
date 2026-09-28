@@ -15,6 +15,7 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 - 이미지·파일 보내기/받기(파일 칩), 대화 History
 - Routines: 목록·생성·즉시 실행·일시정지·삭제·실행 기록
 - Screen: 봇 데스크톱 실시간 보기, 넘겨받기/돌려주기
+- 스킬 `/`: 입력창이 `/`로 시작하면 봇의 스킬 제안 목록(최대 6개, ↑/↓ 이동, Tab·클릭 완성, Esc 닫기). `/스킬이름 …`은 `command.dispatch`로 실행되고 대화에는 게이트웨이의 표시 문구가 남음. 모르는 `/x`는 그냥 텍스트로 보냄. Edit의 "Save as skill"은 마지막으로 보낸 질문을 SKILL.md로 저장(삭제 API는 없음)
 - 연결 끊김 시 Reconnect
 
 ## 설치
@@ -44,7 +45,10 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 
 ## IPC
 
-`omarchy-shell puri.hermes <함수>` — `open close toggle show <bot> select <bot> send <text> steer <text> queue <text> stop newChat answer <text> create <name> <desc> deleteBot <name> setModel <id> attachFile <path> attachClipboard sessions listed openSession <id> routines screenUrl screenTake screenHandback screenState profileGet reconnect state`
+`omarchy-shell puri.hermes <함수>` — `open close toggle show <bot> select <bot> send <text> steer <text> queue <text> stop newChat answer <text> create <name> <desc> deleteBot <name> setModel <id> attachFile <path> attachClipboard sessions listed openSession <id> routines screenUrl screenTake screenHandback screenState profileGet skills skillSave <name> <SKILL.md> setComposer <text> reconnect state`
+
+- `skills`: 선택된 봇의 스킬 목록(캐시)을 JSON으로 돌려주고 새로 받아옴. 서버가 스캔을 약 30초 캐시하므로 방금 저장한 스킬은 잠시 늦게 보일 수 있음
+- `setComposer <text>`: 테스트용. 입력창 텍스트를 바꾸고 지금 보이는 스킬 제안 이름 목록을 JSON으로 돌려줌
 
 ## 로드맵
 

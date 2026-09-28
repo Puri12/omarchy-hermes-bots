@@ -37,6 +37,8 @@ type Command =
   | { cmd: "model"; profile: string; provider: string; model: string }
   | { cmd: "attach"; profile: string; path?: string; clipboard?: boolean }
   | { cmd: "sessions"; profile: string }
+  | { cmd: "skills"; profile: string }
+  | { cmd: "skill.save"; profile: string; name: string; content: string; category?: string }
   | { cmd: "open"; profile: string; session: string }
   | { cmd: "screen.url"; profile: string; open?: boolean }
   | { cmd: "screen.take"; profile: string }
@@ -637,7 +639,48 @@ class Remote {
     emit({ ev: "sent", profile, session: sid });
     const refs = this.pendingRefs.get(profile) ?? [];
     this.pendingRefs.delete(profile);
-    await this.rpc("prompt.submit", { session_id: sid, text: refs.length ? `${refs.join("\n")}\n\n${text}` : text });
+    let prompt = text;
+    // A known skill goes through command.dispatch: the panel shows its safe display text, the model gets
+    // the generated directive. Anything else starting with "/" is ordinary prompt text.
+    const slash = /^\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
+    if (slash && (await this.isSkill(profile, slash[1]))) {
+      const r = await this.rpc("command.dispatch", { session_id: sid, name: slash[1], arg: slash[2] ?? "", ...this.profileParam(profile) });
+      if (r.type === "skill" && r.message) {
+        emit({ ev: "skillShown", profile, session: sid, display: String(r.display || text) });
+        prompt = String(r.message);
+      }
+    }
+    await this.rpc("prompt.submit", { session_id: sid, text: refs.length ? `${refs.join("\n")}\n\n${prompt}` : prompt });
+  }
+
+  private skillsByProfile = new Map<string, Json[]>();
+
+  async skills(profile: string) {
+    await this.requireProfile(profile);
+    const rows = (await this.api(`/api/skills?profile=${encodeURIComponent(profile)}`)) as unknown as Json[];
+    const skills = (Array.isArray(rows) ? rows : []).map((s) => ({
+      name: String(s.name ?? ""), description: String(s.description ?? ""),
+      category: String(s.category ?? ""), enabled: s.enabled !== false,
+    })).filter((s) => s.name);
+    this.skillsByProfile.set(profile, skills);
+    emit({ ev: "skills", profile, skills });
+    return skills;
+  }
+
+  // A miss refetches once, so a skill saved from another client is still recognized.
+  private async isSkill(profile: string, name: string): Promise<boolean> {
+    const has = (list: Json[]) => list.some((s) => s.name === name && s.enabled !== false);
+    const cached = this.skillsByProfile.get(profile);
+    return (cached !== undefined && has(cached)) || has(await this.skills(profile));
+  }
+
+  async skillSave(profile: string, name: string, content: string, category?: string) {
+    await this.requireProfile(profile);
+    await this.api("/api/skills", { method: "POST",
+      body: JSON.stringify({ name, content, profile, ...(category ? { category } : {}) }) });
+    emit({ ev: "skillSaved", profile, name });
+    // The server caches its skill scan for ~30 s, so a fresh save may be missing from this first list.
+    await this.skills(profile);
   }
 
   // Steer injects text into the running turn; queue holds it until the turn ends. Both are
@@ -1078,6 +1121,8 @@ class Remote {
       }
       case "load": return this.load(c.profile);
       case "send": return this.send(c.profile, c.text);
+      case "skills": return void (await this.skills(c.profile));
+      case "skill.save": return this.skillSave(c.profile, c.name, c.content, c.category);
       case "interrupt": return this.interrupt(c.profile);
       case "steer": return this.steer(c.profile, c.text);
       case "queue": return this.queue(c.profile, c.text);

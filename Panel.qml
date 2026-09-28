@@ -60,6 +60,20 @@ Panel {
   property bool editing: false
   property var profileInfo: ({})
   property bool showHidden: false
+  property var skillsByProfile: ({})
+  property string composerText: ""
+  property bool skillsDismissed: false
+  property int skillIndex: 0
+  readonly property var selectedSkills: { revision; return skillsByProfile[selected] || [] }
+  // "/prefix" with no space yet: up to 6 enabled skills whose name starts with the prefix.
+  readonly property var skillMatches: {
+    var t = composerText
+    if (skillsDismissed || t.charAt(0) !== "/" || /\s/.test(t)) return []
+    var prefix = t.slice(1).toLowerCase()
+    return selectedSkills.filter(function(s) {
+      return s.enabled !== false && s.name.toLowerCase().indexOf(prefix) === 0
+    }).slice(0, 6)
+  }
 
   // Pinned bots first (order otherwise kept); hidden bots only with "Show hidden".
   readonly property var rosterProfiles: {
@@ -141,6 +155,7 @@ Panel {
     routineRunsShown = ""
     armedRoutine = ""
     ensureLoaded(selected)
+    refreshSkills()
     if (showingRoutines) refreshRoutines()
     if (editing) refreshProfile()
   }
@@ -501,6 +516,22 @@ Panel {
     case "deleted":
       forgetBot(ev.name)
       break
+    case "skills":
+      skillsByProfile[ev.profile] = ev.skills || []
+      revision++
+      break
+    case "skillShown":
+      // The typed "/name" row becomes the gateway's display text; the directive itself is never shown.
+      var shownIn = ev.profile || profileForSession(ev.session)
+      var rows = (transcripts[shownIn] || []).slice()
+      for (var r = rows.length - 1; r >= 0; r--) {
+        if (rows[r].role !== "you") continue
+        rows[r] = Object.assign({}, rows[r], { text: ev.display })
+        transcripts[shownIn] = rows
+        revision++
+        break
+      }
+      break
     case "disconnected":
       connected = false
       statusLine = "Disconnected"
@@ -671,6 +702,39 @@ Panel {
 
   function refreshProfile() { sendCommand({ cmd: "profile.get", profile: selected }) }
 
+  function refreshSkills() { if (selected) sendCommand({ cmd: "skills", profile: selected }) }
+
+  function completeSkill(i) {
+    var s = skillMatches[i]
+    if (!s) return
+    input.text = "/" + s.name + " "
+    input.cursorPosition = input.text.length
+  }
+
+  function saveSkill(rawName, content) {
+    var name = String(rawName || "").trim().toLowerCase().replace(/\s+/g, "-")
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(name) || !content) return false
+    sendCommand({ cmd: "skill.save", profile: selected, name: name, content: content })
+    return true
+  }
+
+  // Minimal SKILL.md from the last thing the user asked this bot.
+  function saveLastPromptAsSkill(rawName) {
+    var prompt = ""
+    for (var i = messages.length - 1; i >= 0 && prompt === ""; i--)
+      if (messages[i].role === "you") prompt = String(messages[i].text || "").trim()
+    if (prompt === "") { lastError = "no prompt to save as a skill"; return false }
+    var name = String(rawName || "").trim().toLowerCase().replace(/\s+/g, "-")
+    // POST /api/skills rejects a new skill whose description exceeds 60 characters
+    // (Hermes SKILL_PROMPT_DESC_LIMIT, counted in code points).
+    var first = Array.from(prompt.split("\n")[0].trim())
+    var desc = first.length > 60 ? first.slice(0, 59).join("") + "…" : first.join("")
+    var content = "---\nname: " + name + "\ndescription: " + JSON.stringify(desc) + "\n---\n\n# " + name
+      + "\n\n## Instructions\n\n" + prompt + "\n"
+    if (!saveSkill(name, content)) { lastError = "invalid skill name: " + rawName; return false }
+    return true
+  }
+
   function saveProfile(description, soul) {
     lastError = ""
     sendCommand({ cmd: "profile.save", profile: selected, description: String(description || "").trim(), soul: String(soul || "") })
@@ -823,6 +887,17 @@ Panel {
     function routines(): string {
       root.refreshRoutines()
       return JSON.stringify({ profile: root.selected, loaded: root.routinesLoaded, jobs: root.routines, error: root.lastError })
+    }
+    // Returns the cached list for the selected bot and asks the helper for a fresh one.
+    function skills(): string {
+      root.refreshSkills()
+      return JSON.stringify({ profile: root.selected, skills: root.selectedSkills })
+    }
+    function skillSave(name: string, content: string): string { return root.saveSkill(name, content) ? "saving" : "invalid" }
+    // Test hook: sets the composer text and returns the suggestion names it now shows.
+    function setComposer(text: string): string {
+      input.text = text
+      return JSON.stringify(root.skillMatches.map(function(s) { return s.name }))
     }
     function routineCreate(name: string, schedule: string, prompt: string): string {
       return root.createRoutine(name, schedule, prompt) ? "creating" : "invalid"
@@ -1468,6 +1543,21 @@ Panel {
               onClicked: root.setProfileFlag("hidden", !(root.selectedInfo && root.selectedInfo.hidden))
             }
             TextField {
+              id: skillNameField
+              width: Style.space(120)
+              placeholderText: "skill name"
+              foreground: root.foreground
+              onAccepted: { if (root.saveLastPromptAsSkill(text)) text = "" }
+            }
+            Button {
+              text: "Save as skill"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: { if (root.saveLastPromptAsSkill(skillNameField.text)) skillNameField.text = "" }
+            }
+            TextField {
               id: duplicateField
               width: Style.space(120)
               placeholderText: "copy name"
@@ -1907,6 +1997,49 @@ Panel {
           }
         }
 
+        // Skill suggestions for "/prefix": Up/Down move, Tab or click completes, Esc closes.
+        Column {
+          visible: root.skillMatches.length > 0
+          width: parent.width
+
+          Repeater {
+            model: root.skillMatches
+            Item {
+              required property var modelData
+              required property int index
+              width: parent.width
+              implicitHeight: skillLabel.implicitHeight + Style.space(6)
+
+              Rectangle {
+                anchors.fill: parent
+                radius: Style.cornerRadius
+                color: index === root.skillIndex ? root.alpha(root.foreground, 0.14) : "transparent"
+              }
+
+              Text {
+                id: skillLabel
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.leftMargin: Style.space(8)
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: "/" + modelData.name + (modelData.description ? " — " + modelData.description : "")
+                elide: Text.ElideRight
+                wrapMode: Text.NoWrap
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: { root.completeSkill(index); input.forceActiveFocus() }
+              }
+            }
+          }
+        }
+
         Row {
           width: parent.width
           spacing: Style.spacing.sm
@@ -1936,8 +2069,24 @@ Panel {
                 border.width: 1
                 border.color: root.alpha(root.foreground, input.activeFocus ? 0.5 : 0.2)
               }
+              onTextChanged: {
+                root.composerText = text
+                root.skillsDismissed = false
+                root.skillIndex = 0
+                if (text === "/" && root.skillsByProfile[root.selected] === undefined) root.refreshSkills()
+              }
               Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Escape) {
+                var n = root.skillMatches.length
+                if (n > 0 && (event.key === Qt.Key_Up || event.key === Qt.Key_Down)) {
+                  event.accepted = true
+                  root.skillIndex = (root.skillIndex + (event.key === Qt.Key_Up ? n - 1 : 1)) % n
+                } else if (n > 0 && event.key === Qt.Key_Tab) {
+                  event.accepted = true
+                  root.completeSkill(root.skillIndex)
+                } else if (n > 0 && event.key === Qt.Key_Escape) {
+                  event.accepted = true
+                  root.skillsDismissed = true
+                } else if (event.key === Qt.Key_Escape) {
                   event.accepted = true
                   root.close()
                 } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
