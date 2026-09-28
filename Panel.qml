@@ -44,6 +44,13 @@ Panel {
   property var todosByProfile: ({})
   property var unreadProfiles: ({})
   property bool searching: false
+  // Text of a transcript row the next message replies to (right-click a bubble); sent as a > quote.
+  property string quoteText: ""
+  function quoteRow(m) {
+    if (!m || m.role === "tool") return
+    quoteText = displayText(m.text).slice(0, 400)
+    Qt.callLater(function() { input.forceActiveFocus() })
+  }
   property string searchText: ""
   // The transcript filtered by the Search field (case-insensitive substring); unfiltered when empty.
   readonly property var shownMessages: {
@@ -168,6 +175,7 @@ Panel {
   onSelectedChanged: {
     searching = false
     searchText = ""
+    quoteText = ""
     if (unreadProfiles[selected]) {
       delete unreadProfiles[selected]
       revision++
@@ -594,6 +602,10 @@ Panel {
     var images = pendingImages
     var files = pendingFiles
     if ((text === "" && images.length === 0 && files.length === 0) || busy || attaching) return false
+    if (quoteText !== "" && text !== "") {
+      text = quoteText.split("\n").map(function(l) { return "> " + l }).join("\n") + "\n\n" + text
+      quoteText = ""
+    }
     if (clearingProfiles[selected]) {
       if (queuedSendByProfile[selected]) return false
       queuedSendByProfile[selected] = { text: text, images: images, files: files }
@@ -980,6 +992,10 @@ Panel {
     }
     // Returns the cached list for the selected bot and asks the helper for a fresh one.
     function unread(): string { return JSON.stringify(root.unreadProfiles) }
+    function quote(index: int): string {
+      root.quoteRow(root.shownMessages[index])
+      return root.quoteText
+    }
     function search(text: string): string {
       root.searching = text !== ""
       root.searchText = text
@@ -1890,6 +1906,12 @@ Panel {
                 onClicked: parent.expanded = !parent.expanded
               }
 
+              MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.RightButton
+                onClicked: root.quoteRow(parent.modelData)
+              }
+
               Text {
                 id: bubbleText
                 anchors.top: parent.top
@@ -2138,6 +2160,32 @@ Panel {
             loops: Animation.Infinite
             NumberAnimation { from: 1; to: 0.45; duration: 900; easing.type: Easing.InOutQuad }
             NumberAnimation { from: 0.45; to: 1; duration: 900; easing.type: Easing.InOutQuad }
+          }
+        }
+
+        Row {
+          visible: root.quoteText !== ""
+          width: parent.width
+          spacing: Style.spacing.sm
+
+          Text {
+            width: parent.width - quoteClear.width - parent.spacing
+            anchors.verticalCenter: parent.verticalCenter
+            text: "↩ replying to: " + root.quoteText.split("\n")[0]
+            elide: Text.ElideRight
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Button {
+            id: quoteClear
+            text: "×"
+            bordered: true
+            foreground: root.dim
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: root.quoteText = ""
           }
         }
 

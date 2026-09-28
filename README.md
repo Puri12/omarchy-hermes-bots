@@ -11,6 +11,7 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 - 봇 목록·생성·삭제(2단계 확인)·모델 변경, 봇 설명/SOUL 편집·복제·고정·숨김
 - 봇 목록 상태 표시: `?` 답을 기다림 · `…` 작업 중 · `⏱` 예약 작업 실행 중 · `•` 보지 않는 동안 새 답장·알림 (선택하면 지워짐, IPC `unread`)
 - 대화 검색: History 옆 **Search**로 현재 대화에서 글자가 들어간 줄만 표시(일치 수 표시, Esc로 닫기, IPC `search <text>`)
+- 답장 인용: 말풍선을 오른쪽 클릭하면 입력창 위에 `↩ replying to`가 뜨고, 보낼 때 `> ` 인용으로 앞에 붙음(× 로 취소, IPC `quote <index>`)
 - 스트리밍 답변, 작업 상태줄(thinking/writing/도구·경과 시간), 봇의 할 일 목록, 토큰·컨텍스트 사용량
 - 작업 중 추가 지시(Steer/Queue), 중지
 - 질문(clarify)·승인 카드, 긴급 알림, 루틴(cron) 완료 알림
