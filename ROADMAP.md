@@ -65,9 +65,12 @@
 | 4 | ✅ 완료 — Routines 섹션(목록·생성·즉시 실행·일시정지/재개·삭제·실행 기록) | `.omo/mass-ulw/evidence/item4.md`, `item4-panel/` |
 | 5 | ✅ 완료 — 모든 파일 첨부(`file.attach`), 봇이 만든 파일 칩·내려받기·열기 | `.omo/mass-ulw/evidence/item5.md` |
 | 6 | ✅ 완료 — Edit 섹션(설명·SOUL·복제·고정·숨김) | `.omo/mass-ulw/evidence/item6.md` |
-| 7 | ⏳ 다음 작업 — 시간 부족으로 미착수 | |
+| 7 | ✅ 완료 — 공유 헬퍼 데몬(Unix 소켓) 하나를 모든 패널이 사용, 셸 재시작에도 유지, 코드 변경 시 자동 교체, 알림 중복 없음 | 커밋 `016e94b` |
 | 15 | ✅ 완료(추가 후보) — 봇의 할 일 목록을 상태줄 위에 ☐/◐/☑로 실시간 표시, 하단이 커져도 최신 메시지가 보이게 자동 스크롤 | `.omo/mass-ulw/evidence/item15-todos.png` |
 | 17 | ✅ 완료(추가 후보) — 헬퍼가 재시작돼 넘겨받은 화면의 권한을 잃어도 Hand back이 강제 해제로 봇에게 돌려줌(VM lease: human → agent 확인) | `.omo/mass-ulw/NOTEPAD.md` |
 | 19 | ✅ 완료(추가 후보) — 모델 줄에 `context N% · 67.1k tokens` 사용량 표시 | `.omo/mass-ulw/evidence/item19-usage.png` |
-| 8–12 | ⏳ 다음 작업 — 조사 보고서만 완료(`research/r8`–`r10`) | `.omo/mass-ulw/research/` |
+| 9 | ✅ 완료 — 입력창 `/` 스킬 자동완성, `command.dispatch`로 실행, Save as skill | 커밋 `af7a181` |
+| 8, 10, 11, 12 | ⏳ 다음 작업 — 그룹 채팅, 음성, 초안 카드(조사 필요), 대화 편의(답장·안 읽음·검색·단축키) | |
+| 18, 21, 22 | ✅ 완료(추가 후보) — History에서 이름 바꾸기·보관·삭제, 패널 넘침 전수 점검, cron 지시문·첨부 확장문 접기 | 커밋 `4596f42` |
+| 여러 줄 입력·링크 색·Reconnect | ✅ 완료 — Shift+Enter 줄바꿈, 링크 강조색, 연결 끊김 시 다시 연결 | 커밋 `0258bed` 외 |
 | 결함 | ✅ 새 대화 직후 전송 경쟁 조건, History 넘침, 봇 버튼 줄 겹침, 루틴 과잉 제한 수정 | `evidence/race.md`, `history-overflow.png`, `actions-row.png` |
