@@ -43,6 +43,15 @@ Panel {
   property var activityByProfile: ({})
   property var todosByProfile: ({})
   property var unreadProfiles: ({})
+  property bool searching: false
+  property string searchText: ""
+  // The transcript filtered by the Search field (case-insensitive substring); unfiltered when empty.
+  readonly property var shownMessages: {
+    revision
+    var q = searchText.trim().toLowerCase()
+    if (q === "") return messages
+    return messages.filter(function(m) { return String(m.text || "").toLowerCase().indexOf(q) >= 0 })
+  }
   property var usageByProfile: ({})
   readonly property var selectedTodos: { revision; return todosByProfile[selected] || [] }
   property var cronRunning: ({})
@@ -157,6 +166,8 @@ Panel {
   }
 
   onSelectedChanged: {
+    searching = false
+    searchText = ""
     if (unreadProfiles[selected]) {
       delete unreadProfiles[selected]
       revision++
@@ -969,6 +980,11 @@ Panel {
     }
     // Returns the cached list for the selected bot and asks the helper for a fresh one.
     function unread(): string { return JSON.stringify(root.unreadProfiles) }
+    function search(text: string): string {
+      root.searching = text !== ""
+      root.searchText = text
+      return String(root.shownMessages.length)
+    }
     function skills(): string {
       root.refreshSkills()
       return JSON.stringify({ profile: root.selected, skills: root.selectedSkills })
@@ -1123,7 +1139,7 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       // renameField lives inside the History Repeater and cannot be named here.
-      blocked: input.activeFocus || nameField.activeFocus || descField.activeFocus || root.renamingSession !== ""
+      blocked: input.activeFocus || searchField.activeFocus || nameField.activeFocus || descField.activeFocus || root.renamingSession !== ""
         || clarifyField.activeFocus || modelField.activeFocus || attachField.activeFocus
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
@@ -1255,6 +1271,31 @@ Panel {
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               onClicked: root.toggleSessions()
+            }
+
+            Button {
+              text: root.searching && root.searchText.trim() !== "" ? "Search · " + root.shownMessages.length : "Search"
+              bordered: true
+              selected: root.searching
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: {
+                root.searching = !root.searching
+                if (root.searching) Qt.callLater(function() { searchField.forceActiveFocus() })
+                else { root.searchText = ""; searchField.text = "" }
+              }
+            }
+
+            TextField {
+              id: searchField
+              visible: root.searching
+              width: Style.space(170)
+              placeholderText: "search this chat"
+              foreground: root.foreground
+              text: root.searchText
+              onTextChanged: root.searchText = text
+              Keys.onEscapePressed: { text = ""; root.searching = false; input.forceActiveFocus() }
             }
 
             Button {
@@ -1822,7 +1863,7 @@ Panel {
           }
 
           Repeater {
-            model: root.messages
+            model: root.shownMessages
 
             Rectangle {
               required property var modelData
