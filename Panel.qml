@@ -336,7 +336,7 @@ Panel {
     case "history":
       if (ev.session) sessionOwner[ev.session] = ev.profile
       if (ev.replace) {
-        transcripts[ev.profile] = compactTools(ev.messages || [])
+        transcripts[ev.profile] = compactTools(tidyHistory(ev.messages))
         pendingByProfile[ev.profile] = []
         pendingFilesByProfile[ev.profile] = []
         historyShown[ev.profile] = true
@@ -344,7 +344,7 @@ Panel {
         revision++
       } else if (!historyShown[ev.profile]) {
         // Rows that arrived before the history load (a live reply, a cron report) stay after it.
-        transcripts[ev.profile] = compactTools((ev.messages || []).concat(transcripts[ev.profile] || []))
+        transcripts[ev.profile] = compactTools(tidyHistory(ev.messages).concat(transcripts[ev.profile] || []))
         historyShown[ev.profile] = true
         revision++
       }
@@ -775,6 +775,72 @@ Panel {
     return true
   }
 
+  property string renamingSession: ""
+  property string armedSessionDelete: ""
+
+  function sessionRename(id, title) {
+    title = String(title || "").trim()
+    if (!id || title === "") return false
+    renamingSession = ""
+    sendCommand({ cmd: "session.rename", profile: selected, id: id, title: title })
+    return true
+  }
+
+  function sessionArchive(id) {
+    if (!id) return false
+    sendCommand({ cmd: "session.archive", profile: selected, id: id })
+    return true
+  }
+
+  function sessionDelete(id) {
+    if (!id) return false
+    armedSessionDelete = ""
+    sendCommand({ cmd: "session.delete", profile: selected, id: id })
+    return true
+  }
+
+  // Same two-click guard as deleting a bot.
+  function requestSessionDelete(id) {
+    if (armedSessionDelete !== id) {
+      armedSessionDelete = id
+      armedAt = Date.now()
+      disarmTimer.restart()
+      return false
+    }
+    if (Date.now() - armedAt < 800) return false
+    disarmTimer.stop()
+    return sessionDelete(id)
+  }
+
+  // Stored "you" rows carry what Hermes fed the model: the cron scaffold and the expanded
+  // attachments. Show what the user wrote; `full` keeps the original for click-to-expand.
+  function tidyHistory(messages) {
+    return (messages || []).map(function(m) {
+      if (m.role !== "you") return m
+      var raw = String(m.text || "")
+      // Jobs with skills put the skill text before the hint, so it is not always at index 0.
+      if (raw.indexOf("[IMPORTANT: You are running as a scheduled cron job") >= 0) {
+        var paragraphs = raw.split(/\n\s*\n/).filter(function(p) { return p.trim() !== "" })
+        return { role: "you", text: "", full: raw, scaffold: true,
+          summary: paragraphs[paragraphs.length - 1].trim().replace(/\s+/g, " ") }
+      }
+      var cut = raw.indexOf("--- Attached Context ---")
+      var lines = (cut >= 0 ? raw.slice(0, cut) : raw).split("\n")
+      var files = (m.files || []).slice()
+      while (lines.length > 0) {
+        var ref = /^@(file|image):(.+)$/.exec(lines[0].trim())
+        if (ref) files.push({ name: ref[2].trim().replace(/^["'`]|["'`]$/g, "").split("/").pop() })
+        else if (lines[0].trim() !== "" || files.length === 0) break
+        lines.shift()
+      }
+      if (cut < 0 && files.length === (m.files || []).length) return m
+      var row = { role: "you", text: lines.join("\n").trim(), full: raw }
+      if (files.length > 0) row.files = files
+      if (m.images) row.images = m.images
+      return row
+    })
+  }
+
   function forgetBot(name) {
     delete transcripts[name]
     delete busyProfiles[name]
@@ -877,6 +943,9 @@ Panel {
     function sessions(): string { root.refreshSessions(); return "listing" }
     function listed(): string { return JSON.stringify(root.sessionList) }
     function openSession(id: string): string { return root.openSession(id) ? "opening" : "busy" }
+    function sessionRename(id: string, title: string): string { return root.sessionRename(id, title) ? "renaming" : "invalid" }
+    function sessionArchive(id: string): string { return root.sessionArchive(id) ? "archiving" : "invalid" }
+    function sessionDelete(id: string): string { return root.sessionDelete(id) ? "deleting" : "invalid" }
     // Returns "starting" until the helper reports its server; call again for the URL.
     function screenUrl(): string {
       if (root.screenBase) return root.screenUrl(root.selected)
@@ -970,7 +1039,7 @@ Panel {
     }
   }
 
-  Timer { id: disarmTimer; interval: 5000; onTriggered: root.armedDelete = "" }
+  Timer { id: disarmTimer; interval: 5000; onTriggered: { root.armedDelete = ""; root.armedSessionDelete = "" } }
   Timer { id: routineDisarmTimer; interval: 5000; onTriggered: root.armedRoutine = "" }
   Timer { id: restartTimer; interval: 5000; onTriggered: bridge.running = true }
 
@@ -1042,7 +1111,8 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: input.activeFocus || nameField.activeFocus || descField.activeFocus
+      // renameField lives inside the History Repeater and cannot be named here.
+      blocked: input.activeFocus || nameField.activeFocus || descField.activeFocus || root.renamingSession !== ""
         || clarifyField.activeFocus || modelField.activeFocus || attachField.activeFocus
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
@@ -1073,6 +1143,7 @@ Panel {
             spacing: Style.spacing.sm
 
             Button {
+              id: reconnectButton
               visible: !root.connected
               anchors.verticalCenter: parent.verticalCenter
               text: "Reconnect"
@@ -1086,6 +1157,9 @@ Panel {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               text: (root.connected ? "● " : "○ ") + root.statusLine
+              width: Math.min(implicitWidth, parent.parent.width - title.implicitWidth - Style.space(12)
+                - (reconnectButton.visible ? reconnectButton.width + parent.spacing : 0))
+              elide: Text.ElideRight
               color: root.connected ? root.dim : root.urgent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1268,9 +1342,11 @@ Panel {
           Repeater {
             model: root.sessionList.slice(0, 10)
             Item {
+              id: sessionRow
               required property var modelData
+              readonly property bool renaming: root.renamingSession === modelData.id
               width: parent.width
-              implicitHeight: sessionMeta.implicitHeight + Style.space(8)
+              implicitHeight: sessionTop.height + sessionActions.height + Style.space(10)
 
               Rectangle {
                 anchors.fill: parent
@@ -1278,36 +1354,91 @@ Panel {
                 color: modelData.current ? root.alpha(root.foreground, 0.14) : "transparent"
               }
 
-              Text {
-                id: sessionMeta
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                text: Qt.formatDateTime(new Date(modelData.startedAt * 1000), "MM-dd HH:mm")
-                  + " · " + modelData.messages + " msgs"
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(8)
-                anchors.right: sessionMeta.left
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                text: (modelData.source === "cron" ? "⏱ " : "") + modelData.title
-                elide: Text.ElideRight
-                wrapMode: Text.NoWrap
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
               MouseArea {
                 anchors.fill: parent
+                enabled: !sessionRow.renaming
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.openSession(modelData.id)
+              }
+
+              Item {
+                id: sessionTop
+                x: Style.space(8)
+                y: Style.space(4)
+                width: parent.width - Style.space(16)
+                height: sessionRow.renaming ? renameField.implicitHeight : sessionMeta.implicitHeight
+
+                Text {
+                  id: sessionMeta
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: Qt.formatDateTime(new Date(modelData.startedAt * 1000), "MM-dd HH:mm")
+                    + " · " + modelData.messages + " msgs"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  visible: !sessionRow.renaming
+                  anchors.left: parent.left
+                  anchors.right: sessionMeta.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: (modelData.source === "cron" ? "⏱ " : "") + modelData.title
+                  elide: Text.ElideRight
+                  wrapMode: Text.NoWrap
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                TextField {
+                  id: renameField
+                  visible: sessionRow.renaming
+                  anchors.left: parent.left
+                  anchors.right: sessionMeta.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "title"
+                  foreground: root.foreground
+                  onVisibleChanged: if (visible) { text = modelData.title; forceActiveFocus() }
+                  onAccepted: root.sessionRename(modelData.id, text)
+                  Keys.onEscapePressed: root.renamingSession = ""
+                }
+              }
+
+              Flow {
+                id: sessionActions
+                anchors.top: sessionTop.bottom
+                anchors.topMargin: Style.space(2)
+                x: Style.space(8)
+                width: parent.width - Style.space(16)
+                layoutDirection: Qt.RightToLeft
+                spacing: Style.spacing.sm
+
+                Button {
+                  text: root.armedSessionDelete === modelData.id ? "Click again to delete" : "Delete"
+                  foreground: root.armedSessionDelete === modelData.id ? root.urgent : root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.requestSessionDelete(modelData.id)
+                }
+                Button {
+                  text: "Archive"
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.sessionArchive(modelData.id)
+                }
+                Button {
+                  text: sessionRow.renaming ? "Save" : "Rename"
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: sessionRow.renaming ? root.sessionRename(modelData.id, renameField.text)
+                    : root.renamingSession = modelData.id
+                }
               }
             }
           }
@@ -1686,14 +1817,24 @@ Panel {
               readonly property bool isTool: modelData.role === "tool"
               readonly property var images: modelData.images || []
               readonly property var files: modelData.files || []
+              readonly property bool foldable: !!modelData.full
+              readonly property bool scaffold: !!modelData.scaffold
+              property bool expanded: false
               width: isTool ? parent.width
-                : images.length > 0 || files.length > 0 ? parent.width * 0.88
+                : images.length > 0 || files.length > 0 || scaffold ? parent.width * 0.88
                 : Math.min(parent.width * 0.88, bubbleText.implicitWidth + Style.space(20))
               x: mine ? parent.width - width : 0
               implicitHeight: (bubbleText.visible ? bubbleText.implicitHeight : 0) + imageColumn.implicitHeight
                 + Style.space(12)
               radius: Style.cornerRadius
               color: isTool ? "transparent" : root.alpha(root.foreground, mine ? 0.14 : 0.06)
+
+              MouseArea {
+                anchors.fill: parent
+                enabled: parent.foldable
+                cursorShape: Qt.PointingHandCursor
+                onClicked: parent.expanded = !parent.expanded
+              }
 
               Text {
                 id: bubbleText
@@ -1704,7 +1845,10 @@ Panel {
                 anchors.leftMargin: Style.space(10)
                 anchors.rightMargin: Style.space(10)
                 visible: text !== ""
-                text: modelData.role === "bot" ? root.colorLinks(root.displayText(modelData.text)) : String(modelData.text || "").trim()
+                text: modelData.role === "bot" ? root.colorLinks(root.displayText(modelData.text))
+                  : foldable && expanded ? String(modelData.full).trim()
+                  : scaffold ? "⏱ scheduled job prompt — click to expand"
+                  : String(modelData.text || "").trim()
                 textFormat: modelData.role === "bot" ? Text.MarkdownText : Text.PlainText
                 wrapMode: Text.Wrap
                 color: isTool ? root.dim : root.foreground
@@ -1720,6 +1864,17 @@ Panel {
                 anchors.right: parent.right
                 anchors.margins: Style.space(6)
                 spacing: Style.space(6)
+
+                Text {
+                  visible: scaffold && !expanded
+                  width: parent.width
+                  text: modelData.summary || ""
+                  elide: Text.ElideRight
+                  wrapMode: Text.NoWrap
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
 
                 Repeater {
                   model: images
@@ -1894,17 +2049,25 @@ Panel {
           }
         }
 
-        Text {
+        // One Text per item: ElideRight does not elide the lines of a multi-line NoWrap Text.
+        Column {
           visible: root.selectedTodos.length > 0
           width: parent.width
-          text: root.selectedTodos.slice(0, 8).map(function(t) {
-            return (t.status === "completed" ? "☑ " : t.status === "in_progress" ? "◐ " : t.status === "cancelled" ? "☒ " : "☐ ") + t.text
-          }).join("\n")
-          elide: Text.ElideRight
-          maximumLineCount: 8
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
+
+          Repeater {
+            model: root.selectedTodos.slice(0, 8)
+            Text {
+              required property var modelData
+              width: parent.width
+              text: (modelData.status === "completed" ? "☑ " : modelData.status === "in_progress" ? "◐ "
+                : modelData.status === "cancelled" ? "☒ " : "☐ ") + modelData.text
+              elide: Text.ElideRight
+              wrapMode: Text.NoWrap
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
         }
 
         Text {

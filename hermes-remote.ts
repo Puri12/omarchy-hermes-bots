@@ -40,6 +40,8 @@ type Command =
   | { cmd: "skills"; profile: string }
   | { cmd: "skill.save"; profile: string; name: string; content: string; category?: string }
   | { cmd: "open"; profile: string; session: string }
+  | { cmd: "session.rename"; profile: string; id: string; title: string }
+  | { cmd: "session.archive" | "session.delete"; profile: string; id: string }
   | { cmd: "screen.url"; profile: string; open?: boolean }
   | { cmd: "screen.take"; profile: string }
   | { cmd: "screen.handback"; profile: string }
@@ -731,6 +733,23 @@ class Remote {
     emit({ ev: "sessions", profile, sessions });
   }
 
+  // REST PATCH/DELETE /api/sessions/{id} (the dashboard's own calls); the list is re-read afterwards.
+  async manageSession(profile: string, id: string, action: "rename" | "archive" | "delete", title = "") {
+    await this.requireProfile(profile);
+    const path = `/api/sessions/${encodeURIComponent(id)}`;
+    if (action === "delete") {
+      // The server deletes rows the live agent still flushes into; keep the open conversation.
+      // keyByProfile also covers a chat started with New, whose stored id storedByProfile does not hold.
+      const open = this.sessionByProfile.has(profile) ? this.keyByProfile.get(profile) : undefined;
+      if (id === this.storedByProfile.get(profile) || id === open) throw new RemoteError("cannot delete the open conversation");
+      await this.api(`${path}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" });
+    } else {
+      const body = action === "rename" ? { title, profile } : { archived: true, profile };
+      await this.api(path, { method: "PATCH", body: JSON.stringify(body) });
+    }
+    await this.listSessions(profile);
+  }
+
   // Live session ids differ from the stored ids session.list returns; remember which stored
   // conversation each bot is showing so the History list can mark it.
   private storedByProfile = new Map<string, string>();
@@ -1132,6 +1151,12 @@ class Remote {
       case "attach": return this.attach(c.profile, { path: c.path, clipboard: c.clipboard });
       case "sessions": return this.listSessions(c.profile);
       case "open": return this.openSession(c.profile, c.session);
+      case "session.rename":
+      case "session.archive":
+      case "session.delete": {
+        const action = c.cmd.slice(8) as "rename" | "archive" | "delete";
+        return this.routineCommand(c.profile, () => this.manageSession(c.profile, c.id, action, "title" in c ? c.title : ""));
+      }
       case "screen.url":
         await this.requireProfile(c.profile);
         return emit({ ev: "screen.url", profile: c.profile, base: this.screenBase(), open: c.open === true,
