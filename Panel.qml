@@ -1887,16 +1887,44 @@ Panel {
           width: parent.width
           spacing: Style.spacing.sm
 
-          TextField {
-            id: input
+          // Multi-line composer: Enter sends, Shift+Enter inserts a newline. Grows to ~5 lines, then scrolls.
+          ScrollView {
             width: parent.width - sendButton.width - modelButton.width - parent.spacing * 2
               - (root.busy ? steerButton.width + queueButton.width + parent.spacing * 2
                 : newButton.width + imageButton.width + parent.spacing * 2)
-            placeholderText: root.busy ? "Steer @" + root.selected + " (Enter) or Queue for later" : "Message @" + root.selected
-            foreground: root.foreground
-            enabled: root.connected
-            onAccepted: root.submit()
-            Keys.onEscapePressed: root.close()
+            height: Math.min(Math.max(input.implicitHeight, sendButton.height), Style.space(130))
+            clip: true
+
+            TextArea {
+              id: input
+              wrapMode: TextEdit.Wrap
+              placeholderText: root.busy ? "Steer @" + root.selected + " (Enter) or Queue for later"
+                : "Message @" + root.selected + "  (Shift+Enter: new line)"
+              enabled: root.connected
+              color: root.foreground
+              placeholderTextColor: root.dim
+              selectionColor: root.alpha(Color.accent, 0.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              background: Rectangle {
+                radius: Style.cornerRadius
+                color: root.alpha(root.foreground, 0.06)
+                border.width: 1
+                border.color: root.alpha(root.foreground, input.activeFocus ? 0.5 : 0.2)
+              }
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  event.accepted = true
+                  root.close()
+                } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                    && !(event.modifiers & Qt.ShiftModifier)
+                    && input.preeditText === "") {
+                  // While a Hangul syllable is still being composed, Enter belongs to the IME.
+                  event.accepted = true
+                  root.submit()
+                }
+              }
+            }
           }
 
           Button {
