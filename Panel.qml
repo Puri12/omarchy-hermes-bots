@@ -1,0 +1,1971 @@
+import QtQuick
+import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+Panel {
+  id: root
+  moduleName: "puri.hermes"
+  ipcTarget: "puri.hermes"
+  manageIpc: false
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property string helperPath: Qt.resolvedUrl("hermes-remote.ts").toString().replace("file://", "")
+
+  property bool connected: false
+  property string statusLine: "Connecting…"
+  property string lastError: ""
+  property var profiles: []
+  property string selected: "default"
+  property var transcripts: ({})
+  property var busyProfiles: ({})
+  property var approval: null
+  property var clarify: null
+  property int clarifyIndex: 0
+  property bool pickingModel: false
+  property var loadedProfiles: ({})
+  property var pendingByProfile: ({})
+  property var pendingFilesByProfile: ({})
+  property var receivedFiles: []
+  property var clearingProfiles: ({})
+  property var queuedSendByProfile: ({})
+  property bool attaching: false
+  property bool attachOpen: false
+  property bool creating: false
+  property string armedDelete: ""
+  property double armedAt: 0
+  property int revision: 0
+  property var activityByProfile: ({})
+  property var todosByProfile: ({})
+  property var usageByProfile: ({})
+  readonly property var selectedTodos: { revision; return todosByProfile[selected] || [] }
+  property var cronRunning: ({})
+  property var historyShown: ({})
+  property var sessionList: []
+  property bool showingSessions: false
+  property double nowMs: Date.now()
+  property var screenByProfile: ({})
+  property string screenBase: ""
+  property bool showingRoutines: false
+  property var routinesByProfile: ({})
+  property var routineRunsById: ({})
+  property string routineRunsShown: ""
+  property string armedRoutine: ""
+  property double armedRoutineAt: 0
+  property bool editing: false
+  property var profileInfo: ({})
+  property bool showHidden: false
+
+  // Pinned bots first (order otherwise kept); hidden bots only with "Show hidden".
+  readonly property var rosterProfiles: {
+    var shown = profiles.filter(function(p) { return showHidden || !p.hidden })
+    return shown.filter(function(p) { return p.pinned }).concat(shown.filter(function(p) { return !p.pinned }))
+  }
+  readonly property int hiddenCount: profiles.filter(function(p) { return p.hidden }).length
+  readonly property var selectedInfo: { revision; return profileInfo[selected] || null }
+
+  readonly property var routines: { revision; return routinesByProfile[selected] || [] }
+  readonly property bool routinesLoaded: { revision; return routinesByProfile[selected] !== undefined }
+
+  readonly property var messages: { revision; return transcripts[selected] || [] }
+  readonly property bool busy: { revision; return busyProfiles[selected] === true }
+  readonly property var screenState: { revision; return screenByProfile[selected] || null }
+  readonly property bool screenMine: screenState !== null && screenState.mine === true
+  readonly property string screenCaption: !screenState ? ""
+    : !screenState.running ? "screen off"
+    : screenMine ? "you have control"
+    : screenState.lease && screenState.lease.holder === "human" ? "someone else has control" : "bot has control"
+  readonly property bool anyBusy: {
+    revision
+    for (var k in busyProfiles) if (busyProfiles[k]) return true
+    for (var j in cronRunning) if (cronRunning[j]) return true
+    return false
+  }
+  readonly property string activityLine: {
+    revision
+    var cron = cronRunning[selected]
+    var a = activityByProfile[selected]
+    if (busy) {
+      var secs = Math.max(0, Math.round((nowMs - (a ? a.since : nowMs)) / 1000))
+      var label = !a ? "working…" : a.text === "thinking" ? "thinking…" : a.text === "writing" ? "writing…"
+        : a.text.indexOf("❓") === 0 ? a.text : "⚙ " + a.text
+      return label + " · " + secs + "s"
+    }
+    return cron ? "⏱ scheduled job running: " + cron : ""
+  }
+  readonly property bool waitingOnUser: clarify !== null || approval !== null
+  readonly property string waitingProfile: clarify ? profileForSession(clarify.session)
+    : approval ? profileForSession(approval.session) : ""
+  readonly property var selectedProfile: {
+    for (var i = 0; i < profiles.length; i++) if (profiles[i].name === selected) return profiles[i]
+    return null
+  }
+  readonly property var clarifyQuestion: clarify && clarify.questions ? clarify.questions[clarifyIndex] || null : null
+  readonly property var modelPresets: ["auto/best-coding", "auto/best-fast", "auto/best-reasoning", "auto/cheap"]
+
+  function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
+
+  function notify(title, body, profile, urgency) {
+    if (opened && profile === selected) return
+    Quickshell.execDetached(["omarchy-notification-send", "--app-name", "Hermes Bots", "-g", "󰚩", "-u", urgency || "normal",
+      title, String(body || "").slice(0, 240), "--exec", "omarchy-shell", "puri.hermes", "show", profile || selected])
+  }
+
+  function setActivity(profile, text) {
+    var prev = activityByProfile[profile]
+    activityByProfile[profile] = { text: text, since: prev ? prev.since : Date.now() }
+    nowMs = Date.now()
+    revision++
+  }
+
+  function clearActivity(profile) {
+    delete activityByProfile[profile]
+    revision++
+  }
+
+  function ensureLoaded(profile) {
+    if (!profile || loadedProfiles[profile]) return
+    loadedProfiles[profile] = true
+    sendCommand({ cmd: "load", profile: profile })
+  }
+
+  onSelectedChanged: {
+    showingSessions = false
+    routineRunsShown = ""
+    armedRoutine = ""
+    ensureLoaded(selected)
+    if (showingRoutines) refreshRoutines()
+    if (editing) refreshProfile()
+  }
+
+  function sendCommand(obj) {
+    if (!bridge.running) return
+    bridge.write(JSON.stringify(obj) + "\n")
+  }
+
+  function compactTools(list) {
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i]
+      var prev = out.length > 0 ? out[out.length - 1] : null
+      if (m.role === "tool" && prev && prev.role === "tool" && String(m.text).indexOf("⚙ ") === 0 && String(prev.text).indexOf("⚙ ") === 0)
+        out[out.length - 1] = { role: "tool", text: prev.text + " · " + String(m.text).slice(2) }
+      else out.push(m)
+    }
+    return out
+  }
+
+  readonly property var pendingImages: { revision; return pendingByProfile[selected] || [] }
+  readonly property var pendingFiles: { revision; return pendingFilesByProfile[selected] || [] }
+
+  function displayText(text) {
+    return String(text || "").split("\n").filter(function(l) { return !/^\s*MEDIA:\S+\s*$/.test(l) }).join("\n").trim()
+  }
+
+  // Theme accent, or a light blue when the theme's accent equals the text colour.
+  readonly property color linkColor: Qt.colorEqual(Color.accent, foreground) ? "#8ab4f8" : Color.accent
+
+  // Qt's Markdown renderer ignores Text.linkColor/palette.link and paints links dark blue, which is
+  // unreadable on the dark bubble. Rewrite links (outside code) as inline HTML anchors with an
+  // explicit colour; Qt's Markdown importer keeps inline HTML.
+  function colorLinks(markdown) {
+    var c = String(linkColor)
+    function anchor(url, label) {
+      return "<a href=\"" + url.replace(/"/g, "%22") + "\"><span style=\"color:" + c + "\">" + label + "</span></a>"
+    }
+    function prose(s) {
+      var parts = s.split(/(`[^`\n]*`)/)
+      for (var i = 0; i < parts.length; i += 2) {
+        parts[i] = parts[i]
+          .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, function(m, label, url) { return anchor(url, label) })
+          .replace(/<(https?:\/\/[^>\s]+)>/g, function(m, url) { return anchor(url, url) })
+          .replace(/(^|[\s(])(https?:\/\/[^\s<>()\]"]+[^\s<>()\]".,;:!?])/g, function(m, pre, url) { return pre + anchor(url, url) })
+      }
+      return parts.join("")
+    }
+    var blocks = String(markdown || "").split(/(```[\s\S]*?```)/)
+    for (var i = 0; i < blocks.length; i += 2) blocks[i] = prose(blocks[i])
+    return blocks.join("")
+  }
+
+  function addMedia(profile, remote, local, error) {
+    var list = (transcripts[profile] || []).slice()
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (list[i].role === "bot" && String(list[i].text).indexOf(remote) >= 0) {
+        if (error) {
+          list.splice(i + 1, 0, { role: "tool", text: "image unavailable: " + remote + " (" + error + ")" })
+        } else {
+          var images = (list[i].images || []).slice()
+          if (images.indexOf(local) < 0) images.push(local)
+          list[i] = Object.assign({}, list[i], { images: images })
+        }
+        transcripts[profile] = list
+        revision++
+        return
+      }
+    }
+  }
+
+  function addFile(profile, remote, name, local, error) {
+    receivedFiles = receivedFiles.concat([{ profile: profile, name: name, remote: remote, local: local || "", error: error || "" }]).slice(-10)
+    var list = (transcripts[profile] || []).slice()
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (list[i].role === "bot" && String(list[i].text).indexOf(remote) >= 0) {
+        if (error) {
+          list.splice(i + 1, 0, { role: "tool", text: "file unavailable: " + remote + " (" + error + ")" })
+        } else {
+          var files = (list[i].files || []).filter(function(f) { return f.local !== local })
+          files.push({ name: name, local: local })
+          list[i] = Object.assign({}, list[i], { files: files })
+        }
+        transcripts[profile] = list
+        revision++
+        return
+      }
+    }
+  }
+
+  function openFile(local) { return Qt.openUrlExternally("file://" + local) }
+
+  function pushMessage(profile, role, text, images, files) {
+    var list = (transcripts[profile] || []).slice()
+    var row = { role: role, text: text }
+    if (images && images.length > 0) row.images = images
+    if (files && files.length > 0) row.files = files
+    list.push(row)
+    list = compactTools(list)
+    transcripts[profile] = list
+    revision++
+  }
+
+  function appendToLast(profile, text) {
+    var list = (transcripts[profile] || []).slice()
+    if (list.length === 0 || list[list.length - 1].role !== "bot") list.push({ role: "bot", text: "" })
+    list[list.length - 1] = { role: "bot", text: list[list.length - 1].text + text }
+    transcripts[profile] = list
+    revision++
+  }
+
+  function setBusy(profile, value) {
+    busyProfiles[profile] = value
+    revision++
+  }
+
+  property var sessionOwner: ({})
+
+  function profileForSession(sid) { return sessionOwner[sid] || selected }
+
+  function handleEvent(line) {
+    var ev
+    try { ev = JSON.parse(line) } catch (e) { return }
+    switch (ev.ev) {
+    case "ready":
+      loadedProfiles = ({})
+      sendCommand({ cmd: "refresh" })
+      ensureLoaded(selected)
+      break
+    case "status":
+      connected = true
+      lastError = ""
+      profiles = ev.profiles || []
+      var names = profiles.map(function(p) { return p.name })
+      for (var known in transcripts) if (names.indexOf(known) < 0 && known !== "default") forgetBot(known)
+      if (names.indexOf(selected) < 0) selected = "default"
+      statusLine = ev.url.replace(/^https?:\/\//, "") + " · v" + ev.version
+        + (ev.gatewayRunning ? " · gateway on" : " · gateway off")
+      break
+    case "session":
+      sessionOwner[ev.session] = ev.profile
+      break
+    case "sent":
+      sessionOwner[ev.session] = ev.profile
+      break
+    case "steered":
+    case "queued":
+      if (ev.error) {
+        lastError = ev.error
+        pushMessage(ev.profile, "tool", (ev.ev === "steered" ? "↪ steer failed: " : "⏳ queue failed: ") + ev.error)
+      } else if (ev.status === "sent") {
+        // The turn had already ended, so the text went out as a normal message.
+        pushMessage(ev.profile, "you", ev.text)
+        setBusy(ev.profile, true)
+        setActivity(ev.profile, "thinking")
+      } else {
+        pushMessage(ev.profile, "you", (ev.ev === "steered" ? "↪ steer: " : "⏳ queued: ") + ev.text)
+      }
+      break
+    case "start":
+      // A turn the panel did not start (a queued message draining after the previous turn).
+      var starter = profileForSession(ev.session)
+      if (!busyProfiles[starter]) {
+        setBusy(starter, true)
+        setActivity(starter, "thinking")
+        pushMessage(starter, "tool", "⏳ running queued message")
+      }
+      break
+    case "history":
+      if (ev.session) sessionOwner[ev.session] = ev.profile
+      if (ev.replace) {
+        transcripts[ev.profile] = compactTools(ev.messages || [])
+        pendingByProfile[ev.profile] = []
+        pendingFilesByProfile[ev.profile] = []
+        historyShown[ev.profile] = true
+        showingSessions = false
+        revision++
+      } else if (!historyShown[ev.profile]) {
+        // Rows that arrived before the history load (a live reply, a cron report) stay after it.
+        transcripts[ev.profile] = compactTools((ev.messages || []).concat(transcripts[ev.profile] || []))
+        historyShown[ev.profile] = true
+        revision++
+      }
+      break
+    case "sessions":
+      if (ev.profile === selected) sessionList = ev.sessions || []
+      break
+    case "screen.url":
+      screenBase = ev.base
+      if (ev.open) Qt.openUrlExternally(ev.url)
+      break
+    case "screen":
+      screenByProfile[ev.profile] = { running: ev.running, lease: ev.lease, mine: ev.mine }
+      revision++
+      break
+    case "screen.error":
+      lastError = "@" + ev.profile + " screen: " + ev.message
+      break
+    case "activity":
+      var actor = profileForSession(ev.session)
+      if (busyProfiles[actor]) setActivity(actor, ev.text)
+      break
+    case "usage":
+      usageByProfile[profileForSession(ev.session)] = { total: ev.total, contextPercent: ev.contextPercent }
+      revision++
+      break
+    case "todos":
+      todosByProfile[profileForSession(ev.session)] = ev.todos || []
+      revision++
+      break
+    case "cron.running":
+      cronRunning[ev.profile] = ev.running ? ev.job : ""
+      revision++
+      if (showingRoutines && ev.profile === selected) refreshRoutines()
+      break
+    case "routines":
+      routinesByProfile[ev.profile] = ev.jobs || []
+      revision++
+      break
+    case "routine":
+      if (ev.action === "created" && ev.profile === selected) {
+        routineNameField.text = ""
+        routineScheduleField.text = ""
+        routinePromptField.text = ""
+      }
+      if (ev.action === "delete") {
+        delete routineRunsById[ev.id]
+        revision++
+      }
+      if (ev.action === "run" && routineRunsShown === ev.id) sendCommand({ cmd: "routine.runs", profile: ev.profile, id: ev.id })
+      lastError = ""
+      break
+    case "routine.runs":
+      routineRunsById[ev.id] = ev.runs || []
+      revision++
+      break
+    case "cron":
+      var when = new Date(ev.at)
+      pushMessage(ev.profile, "tool", "⏱ " + ev.job + " · " + Qt.formatTime(when, "HH:mm")
+        + (ev.status && ev.status !== "ok" ? " · " + ev.status + (ev.error ? ": " + ev.error : "") : ""))
+      if (ev.text) pushMessage(ev.profile, "bot", ev.text)
+      if (ev.notify) notify("@" + ev.profile + " · " + ev.job, ev.text || ev.error || ev.status, ev.profile)
+      if (showingRoutines && ev.profile === selected) refreshRoutines()
+      break
+    case "attached":
+      attaching = false
+      lastError = ""
+      if (ev.kind === "file")
+        pendingFilesByProfile[ev.profile] = (pendingFilesByProfile[ev.profile] || []).concat([{ name: ev.name, local: ev.local, ref: ev.ref }])
+      else pendingByProfile[ev.profile] = (pendingByProfile[ev.profile] || []).concat([ev.local])
+      revision++
+      break
+    case "media":
+      addMedia(ev.profile, ev.remote, ev.local, ev.error)
+      break
+    case "file":
+      addFile(ev.profile, ev.remote, ev.name, ev.local, ev.error)
+      break
+    case "cleared":
+      delete todosByProfile[ev.profile]
+      var queued = queuedSendByProfile[ev.profile]
+      transcripts[ev.profile] = []
+      pendingByProfile[ev.profile] = []
+      pendingFilesByProfile[ev.profile] = []
+      busyProfiles[ev.profile] = false
+      delete activityByProfile[ev.profile]
+      delete clearingProfiles[ev.profile]
+      delete queuedSendByProfile[ev.profile]
+      revision++
+      if (queued) sendTextForProfile(ev.profile, queued.text, queued.images, queued.files)
+      if (showingSessions && ev.profile === selected) refreshSessions()
+      break
+    case "model":
+      pickingModel = false
+      profiles = profiles.map(function(p) { return p.name === ev.profile ? Object.assign({}, p, { model: ev.model }) : p })
+      pushMessage(ev.profile, "tool", "model → " + ev.model)
+      break
+    case "clarify":
+      clarify = ev
+      clarifyIndex = 0
+      var asker = profileForSession(ev.session)
+      for (var qi = 0; qi < ev.questions.length; qi++) pushMessage(asker, "tool", "❓ " + ev.questions[qi].question)
+      if (busyProfiles[asker]) setActivity(asker, "❓ waiting for your answer")
+      notify("@" + asker + " asks", ev.questions.length > 0 ? ev.questions[0].question : "", asker, "critical")
+      if (opened && asker === selected) Qt.callLater(function() { clarifyField.forceActiveFocus() })
+      break
+    case "request.cancel":
+      var withdrawn = profileForSession(ev.session)
+      if (clarify && String(clarify.requestId) === String(ev.requestId)) {
+        clarify = null
+        pushMessage(withdrawn, "tool", "❓ question expired" + (ev.reason ? " (" + ev.reason + ")" : ""))
+      }
+      if (approval && String(approval.requestId) === String(ev.requestId)) {
+        approval = null
+        pushMessage(withdrawn, "tool", "✔ approval expired" + (ev.reason ? " (" + ev.reason + ")" : ""))
+      }
+      break
+    case "delta":
+      var writer = profileForSession(ev.session)
+      appendToLast(writer, ev.text)
+      if (busyProfiles[writer] && (!activityByProfile[writer] || activityByProfile[writer].text !== "writing"))
+        setActivity(writer, "writing")
+      break
+    case "tool":
+      if (ev.phase === "start") pushMessage(profileForSession(ev.session), "tool", "⚙ " + ev.name + (ev.context ? " " + ev.context : ""))
+      break
+    case "done":
+      var owner = profileForSession(ev.session)
+      var list = transcripts[owner] || []
+      var lastRow = list.length > 0 ? list[list.length - 1] : null
+      var streamed = lastRow && lastRow.role === "bot" ? String(lastRow.text).trim() : ""
+      // Hermes may complete with "" after streaming the answer; the streamed text is the reply.
+      var finished = String(ev.text || "").trim() || streamed
+      if (finished === "") {
+        if (list.length > 0 && list[list.length - 1].role === "bot" && String(list[list.length - 1].text).trim() === "") {
+          transcripts[owner] = list.slice(0, -1)
+          revision++
+        }
+        pushMessage(owner, "tool", "■ stopped")
+      } else {
+        if (!streamed) pushMessage(owner, "bot", finished)
+        notify("@" + owner + " replied", displayText(finished), owner)
+      }
+      setBusy(owner, false)
+      clearActivity(owner)
+      break
+    case "approval":
+      approval = ev
+      if (busyProfiles[profileForSession(ev.session)]) setActivity(profileForSession(ev.session), "❓ waiting for your approval")
+      notify("@" + profileForSession(ev.session) + " needs approval", ev.description || ev.command,
+        profileForSession(ev.session), "critical")
+      break
+    case "created":
+      creating = false
+      duplicateField.text = ""
+      selected = ev.name
+      break
+    case "profile":
+      profileInfo[ev.profile] = { description: ev.description, soul: ev.soul, pinned: ev.pinned, hidden: ev.hidden }
+      revision++
+      if (editing && ev.profile === selected && !editDescField.activeFocus && !soulArea.activeFocus) {
+        editDescField.text = ev.description
+        soulArea.text = ev.soul
+      }
+      break
+    case "profileSaved":
+      lastError = ""
+      break
+    case "deleted":
+      forgetBot(ev.name)
+      break
+    case "disconnected":
+      connected = false
+      statusLine = "Disconnected"
+      break
+    case "error":
+      lastError = ev.message
+      attaching = false
+      var failed = ev.profile || (ev.session ? profileForSession(ev.session) : selected)
+      if (clearingProfiles[failed]) {
+        delete clearingProfiles[failed]
+        delete queuedSendByProfile[failed]
+        revision++
+      }
+      setBusy(failed, false)
+      clearActivity(failed)
+      if (ev.fatal) connected = false
+      break
+    }
+  }
+
+  function submit() {
+    if (busy) steerText(input.text, "steer")
+    else sendText(input.text)
+    input.text = ""
+  }
+
+  // While the bot works, "steer" redirects the running turn and "queue" runs after it;
+  // the transcript row is added when the helper confirms.
+  function steerText(raw, mode) {
+    var text = String(raw || "").trim()
+    if (text === "") return false
+    if (!busy) return sendText(text)
+    sendCommand({ cmd: mode, profile: selected, text: text })
+    return true
+  }
+
+  function sendText(raw) {
+    var text = String(raw || "").trim()
+    var images = pendingImages
+    var files = pendingFiles
+    if ((text === "" && images.length === 0 && files.length === 0) || busy || attaching) return false
+    if (clearingProfiles[selected]) {
+      if (queuedSendByProfile[selected]) return false
+      queuedSendByProfile[selected] = { text: text, images: images, files: files }
+      pendingByProfile[selected] = []
+      pendingFilesByProfile[selected] = []
+      revision++
+      return true
+    }
+    return sendTextForProfile(selected, text, images, files)
+  }
+
+  // The helper prepends the pending @file: refs to the prompt; the bubble lists the files as chips.
+  function sendTextForProfile(profile, text, images, files) {
+    if (text === "") text = images.length > 0 ? "(image)" : "(file)"
+    pushMessage(profile, "you", text, images, (files || []).map(function(f) { return { name: f.name, local: f.local } }))
+    pendingByProfile[profile] = []
+    pendingFilesByProfile[profile] = []
+    setBusy(profile, true)
+    setActivity(profile, "thinking")
+    sendCommand({ cmd: "send", profile: profile, text: text })
+    return true
+  }
+
+  function toggleSessions() {
+    showingSessions = !showingSessions
+    if (showingSessions) refreshSessions()
+  }
+
+  function refreshSessions() {
+    showingSessions = true
+    sessionList = []
+    sendCommand({ cmd: "sessions", profile: selected })
+  }
+
+  function openSession(id) {
+    if (busy || !id) return false
+    sendCommand({ cmd: "open", profile: selected, session: id })
+    return true
+  }
+
+  function toggleRoutines() {
+    showingRoutines = !showingRoutines
+    if (showingRoutines) refreshRoutines()
+  }
+
+  function refreshRoutines() {
+    sendCommand({ cmd: "routines", profile: selected })
+  }
+
+  function routineCommand(action, id) {
+    if (!id) return false
+    lastError = ""
+    sendCommand({ cmd: "routine." + action, profile: selected, id: id })
+    return true
+  }
+
+  function createRoutine(name, schedule, prompt) {
+    var s = String(schedule || "").trim()
+    var p = String(prompt || "").trim()
+    if (s === "" || p === "") return false
+    lastError = ""
+    sendCommand({ cmd: "routine.create", profile: selected, name: String(name || "").trim(), schedule: s, prompt: p })
+    return true
+  }
+
+  function toggleRoutineRuns(id) {
+    routineRunsShown = routineRunsShown === id ? "" : id
+    if (routineRunsShown !== "") routineCommand("runs", id)
+  }
+
+  // Same two-click guard as bot delete.
+  function requestRoutineDelete(id) {
+    if (!id) return false
+    if (armedRoutine !== id) {
+      armedRoutine = id
+      armedRoutineAt = Date.now()
+      routineDisarmTimer.restart()
+      return false
+    }
+    if (Date.now() - armedRoutineAt < 800) return false
+    armedRoutine = ""
+    routineDisarmTimer.stop()
+    return routineCommand("delete", id)
+  }
+
+  function formatWhen(v) {
+    if (v === null || v === undefined || v === "") return "—"
+    var d = typeof v === "number" ? new Date(v * 1000) : new Date(v)
+    return isNaN(d.getTime()) ? String(v) : Qt.formatDateTime(d, "MM-dd HH:mm")
+  }
+
+  function screenUrl(profile) {
+    return screenBase ? screenBase + "/screen?profile=" + encodeURIComponent(profile) : ""
+  }
+
+  // The helper starts its loopback screen server lazily and answers with "screen.url".
+  function openScreen() {
+    lastError = ""
+    sendCommand({ cmd: "screen.url", profile: selected, open: true })
+  }
+
+  function screenLease(op) {
+    lastError = ""
+    sendCommand({ cmd: op === "take" ? "screen.take" : "screen.handback", profile: selected })
+  }
+
+  function attachFrom(source) {
+    if (busy || attaching) return false
+    attaching = true
+    lastError = ""
+    var cmd = { cmd: "attach", profile: selected }
+    if (source === "clipboard") cmd.clipboard = true
+    else cmd.path = String(source || "").trim()
+    sendCommand(cmd)
+    return true
+  }
+
+  function toggleEdit() {
+    editing = !editing
+    if (editing) {
+      var info = profileInfo[selected]
+      editDescField.text = info ? info.description : ""
+      soulArea.text = info ? info.soul : ""
+      refreshProfile()
+    }
+  }
+
+  function refreshProfile() { sendCommand({ cmd: "profile.get", profile: selected }) }
+
+  function saveProfile(description, soul) {
+    lastError = ""
+    sendCommand({ cmd: "profile.save", profile: selected, description: String(description || "").trim(), soul: String(soul || "") })
+    return true
+  }
+
+  function duplicateProfile(rawName) {
+    var name = String(rawName || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-")
+    if (name === "") return false
+    lastError = ""
+    sendCommand({ cmd: "profile.duplicate", profile: selected, newName: name })
+    return true
+  }
+
+  function setProfileFlag(flag, value) {
+    lastError = ""
+    sendCommand({ cmd: flag === "pinned" ? "profile.pin" : "profile.hide", profile: selected, value: value === true })
+  }
+
+  function createBot() {
+    createNamed(nameField.text, descField.text)
+    nameField.text = ""
+    descField.text = ""
+  }
+
+  function requestDelete(name) {
+    if (!name || name === "default") return false
+    if (armedDelete !== name) {
+      armedDelete = name
+      armedAt = Date.now()
+      disarmTimer.restart()
+      return false
+    }
+    if (Date.now() - armedAt < 800) return false
+    armedDelete = ""
+    disarmTimer.stop()
+    sendCommand({ cmd: "delete", name: name })
+    return true
+  }
+
+  function forgetBot(name) {
+    delete transcripts[name]
+    delete busyProfiles[name]
+    if (selected === name) selected = "default"
+    if (armedDelete === name) armedDelete = ""
+    revision++
+  }
+
+  function createNamed(rawName, description) {
+    var name = String(rawName || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-")
+    if (name === "") return false
+    sendCommand({ cmd: "create", name: name, description: String(description || "").trim() })
+    return true
+  }
+
+  function newChat() {
+    if (busy || clearingProfiles[selected]) return false
+    clearingProfiles[selected] = true
+    revision++
+    sendCommand({ cmd: "new", profile: selected })
+    return true
+  }
+
+  function answerClarify(answer) {
+    var q = clarifyQuestion
+    if (!clarify || !q) return false
+    sendCommand({ cmd: "clarify", requestId: clarify.requestId, answer: String(answer), questionId: q.qid })
+    pushMessage(profileForSession(clarify.session), "tool", "↳ " + (String(answer) === "" ? "(skipped)" : answer))
+    if (clarifyIndex + 1 < clarify.questions.length) clarifyIndex++
+    else {
+      if (busyProfiles[profileForSession(clarify.session)]) setActivity(profileForSession(clarify.session), "thinking")
+      clarify = null
+    }
+    clarifyField.text = ""
+    return true
+  }
+
+  function setModel(model) {
+    var id = String(model || "").trim()
+    if (id === "" || !selectedProfile) return false
+    sendCommand({ cmd: "model", profile: selected, provider: selectedProfile.provider || "custom", model: id })
+    return true
+  }
+
+  IpcHandler {
+    target: "puri.hermes"
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function select(name: string): string { root.selected = name; return "ok" }
+    function send(text: string): string { return root.sendText(text) ? "sent" : "busy-or-empty" }
+    function create(name: string, description: string): string { return root.createNamed(name, description) ? "creating" : "invalid" }
+    function deleteBot(name: string): string {
+      if (name === "default" || root.profiles.every(function(p) { return p.name !== name })) return "refused"
+      root.sendCommand({ cmd: "delete", name: name })
+      return "deleting"
+    }
+    function armDelete(name: string): string { root.requestDelete(name); return root.armedDelete }
+    function toggleModelPicker(): string { root.pickingModel = !root.pickingModel; return String(root.pickingModel) }
+    function steer(text: string): string { return root.steerText(text, "steer") ? (root.busy ? "steering" : "sent") : "empty" }
+    function queue(text: string): string { return root.steerText(text, "queue") ? (root.busy ? "queueing" : "sent") : "empty" }
+    function stop(): string { root.sendCommand({ cmd: "interrupt", profile: root.selected }); return "interrupting" }
+    function newChat(): string { return root.newChat() ? "cleared" : "busy" }
+    function answer(text: string): string { return root.answerClarify(text) ? "answered" : "no-question" }
+    function setModel(model: string): string { return root.setModel(model) ? "setting" : "invalid" }
+    function geometry(): string {
+      if (!root.opened) return "closed"
+      var p = keyCatcher.mapToItem(null, 0, 0)
+      return Math.round(p.x) + "," + Math.round(p.y) + " " + Math.round(keyCatcher.width) + "x" + Math.round(keyCatcher.height)
+    }
+    function reconnect(): string { root.reconnect(); return "reconnecting" }
+    function state(): string {
+      var last = root.messages.length > 0 ? root.messages[root.messages.length - 1] : null
+      return JSON.stringify({ connected: root.connected, status: root.statusLine, selected: root.selected,
+        profiles: root.profiles.map(function(p) { return p.name }), busy: root.busy, armedDelete: root.armedDelete,
+        roster: root.rosterProfiles.map(function(p) { return p.name }), editing: root.editing,
+        model: root.selectedProfile ? root.selectedProfile.model : "",
+        clarify: root.clarifyQuestion, approval: root.approval ? root.approval.description || root.approval.command : null,
+        pendingImages: root.pendingImages, pendingFiles: root.pendingFiles, attaching: root.attaching,
+        activity: root.activityLine, showingSessions: root.showingSessions,
+        todos: root.selectedTodos,
+        usage: root.usageByProfile[root.selected] || null,
+        messageCount: root.messages.length, last: last, transcript: root.messages.slice(-5), error: root.lastError })
+    }
+    function attachClipboard(): string { return root.attachFrom("clipboard") ? "attaching" : "busy" }
+    function attachFile(path: string): string { return root.attachFrom(path) ? "attaching" : "busy" }
+    function files(): string { return JSON.stringify(root.receivedFiles) }
+    // Same path as clicking the newest chip named `name` in the selected bot's chat.
+    function openFile(name: string): string {
+      for (var i = root.messages.length - 1; i >= 0; i--) {
+        var hit = (root.messages[i].files || []).find(function(f) { return f.name === name && f.local })
+        if (hit) return root.openFile(hit.local) ? hit.local : "failed"
+      }
+      return "not-found"
+    }
+    function show(name: string): void {
+      if (root.profiles.some(function(p) { return p.name === name })) root.selected = name
+      root.open()
+    }
+    function sessions(): string { root.refreshSessions(); return "listing" }
+    function listed(): string { return JSON.stringify(root.sessionList) }
+    function openSession(id: string): string { return root.openSession(id) ? "opening" : "busy" }
+    // Returns "starting" until the helper reports its server; call again for the URL.
+    function screenUrl(): string {
+      if (root.screenBase) return root.screenUrl(root.selected)
+      root.sendCommand({ cmd: "screen.url", profile: root.selected })
+      return "starting"
+    }
+    // Routine calls are async: these return the cached list and ask the helper for a fresh one.
+    function routines(): string {
+      root.refreshRoutines()
+      return JSON.stringify({ profile: root.selected, loaded: root.routinesLoaded, jobs: root.routines, error: root.lastError })
+    }
+    function routineCreate(name: string, schedule: string, prompt: string): string {
+      return root.createRoutine(name, schedule, prompt) ? "creating" : "invalid"
+    }
+    function routineRun(id: string): string { return root.routineCommand("run", id) ? "running" : "invalid" }
+    function routinePause(id: string): string { return root.routineCommand("pause", id) ? "pausing" : "invalid" }
+    function routineResume(id: string): string { return root.routineCommand("resume", id) ? "resuming" : "invalid" }
+    function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
+    // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
+    function routinesView(runsId: string): string {
+      if (!root.showingRoutines) root.toggleRoutines()
+      if (runsId && root.routineRunsShown !== runsId) root.toggleRoutineRuns(runsId)
+      return "shown"
+    }
+    function routineRuns(id: string): string {
+      root.routineCommand("runs", id)
+      return JSON.stringify({ id: id, runs: root.routineRunsById[id] || null, error: root.lastError })
+    }
+    // Profile calls are async: profileGet returns the cached copy and asks the helper for a fresh one.
+    function profileGet(): string {
+      root.refreshProfile()
+      return JSON.stringify({ profile: root.selected, loaded: root.selectedInfo !== null, info: root.selectedInfo, error: root.lastError })
+    }
+    function profileSave(description: string, soul: string): string { return root.saveProfile(description, soul) ? "saving" : "invalid" }
+    function profileDuplicate(newName: string): string { return root.duplicateProfile(newName) ? "duplicating" : "invalid" }
+    function pin(value: bool): string { root.setProfileFlag("pinned", value); return value ? "pinning" : "unpinning" }
+    function hide(value: bool): string { root.setProfileFlag("hidden", value); return value ? "hiding" : "unhiding" }
+    function showHidden(value: bool): string { root.showHidden = value; return String(root.showHidden) }
+    // Opens the Edit section the same way its button does; used for captures.
+    function editView(): string { if (!root.editing) root.toggleEdit(); return "shown" }
+    function screenTake(): string { root.screenLease("take"); return "taking" }
+    function screenHandback(): string { root.screenLease("handback"); return "handing-back" }
+    function screenState(): string {
+      var s = root.screenState
+      return JSON.stringify({ profile: root.selected, url: root.screenUrl(root.selected), caption: root.screenCaption,
+        running: s ? s.running : null, holder: s && s.lease ? s.lease.holder : null, mine: root.screenMine,
+        error: root.lastError })
+    }
+  }
+
+  function answerApproval(choice) {
+    if (!approval) return
+    sendCommand({ cmd: "approve", requestId: approval.requestId, choice: choice })
+    pushMessage(profileForSession(approval.session), "tool", "✔ approval: " + choice)
+    if (busyProfiles[profileForSession(approval.session)]) setActivity(profileForSession(approval.session), "thinking")
+    approval = null
+  }
+
+  Process {
+    id: bridge
+    stdinEnabled: true
+    command: ["sh", "-c",
+      "for b in \"$HOME/.bun/bin/bun\" \"$HOME/.local/share/mise/shims/bun\" \"$(command -v bun)\"; do "
+      + "[ -x \"$b\" ] && exec \"$b\" \"$0\" stdio; done; "
+      + "echo '{\"ev\":\"error\",\"fatal\":true,\"message\":\"bun not found\"}'", root.helperPath]
+    stdout: SplitParser { onRead: function(data) { root.handleEvent(data) } }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") console.warn("puri.hermes", text.trim())
+    }
+    onExited: function(code) {
+      root.connected = false
+      if (root.reconnectPending) {
+        root.reconnectPending = false
+        bridge.running = true
+        return
+      }
+      root.statusLine = "Helper exited (" + code + "), retrying"
+      restartTimer.restart()
+    }
+  }
+
+  Timer { id: disarmTimer; interval: 5000; onTriggered: root.armedDelete = "" }
+  Timer { id: routineDisarmTimer; interval: 5000; onTriggered: root.armedRoutine = "" }
+  Timer { id: restartTimer; interval: 5000; onTriggered: bridge.running = true }
+
+  // Restart the helper: a fresh login, WebSocket and session resume, whatever state the old one
+  // was stuck in. Transcripts stay; 'ready' reloads the selected bot and refreshes status.
+  function reconnect() {
+    restartTimer.stop()
+    connected = false
+    lastError = ""
+    statusLine = "Reconnecting…"
+    if (bridge.running) {
+      reconnectPending = true
+      bridge.running = false
+    } else {
+      bridge.running = true
+    }
+  }
+  property bool reconnectPending: false
+  Timer { interval: 60000; running: true; repeat: true; onTriggered: root.sendCommand({ cmd: "refresh" }) }
+  Timer { interval: 1000; running: root.anyBusy; repeat: true; onTriggered: root.nowMs = Date.now() }
+  Component.onCompleted: bridge.running = true
+
+  onOpenedChanged: if (opened) {
+    sendCommand({ cmd: "refresh" })
+    ensureLoaded(selected)
+    Qt.callLater(function() { input.forceActiveFocus() })
+  }
+
+    BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: "󰚩"
+    active: root.anyBusy || root.waitingOnUser
+    // Red when a bot is blocked on the user, accent while bots are merely working.
+    activeColor: root.waitingOnUser ? root.urgent : Color.accent
+    tooltipText: root.waitingOnUser ? "@" + root.waitingProfile + " is waiting for you"
+      : root.anyBusy ? "Hermes bots working" : "Hermes Bots"
+    onPressed: function(buttonCode) { root.toggle() }
+  }
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: input
+    contentWidth: panel.fittedContentWidth(Style.space(460))
+    contentHeight: panel.fittedContentHeight(Style.space(620), Style.space(620))
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: input.activeFocus || nameField.activeFocus || descField.activeFocus
+        || clarifyField.activeFocus || modelField.activeFocus || attachField.activeFocus
+        || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
+        || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+
+      Column {
+        id: header
+        width: parent.width
+        spacing: Style.space(8)
+
+        Item {
+          width: parent.width
+          implicitHeight: title.implicitHeight
+
+          Text {
+            id: title
+            text: "Hermes Bots"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title !== undefined ? Style.font.title : Style.font.body * 1.3
+            font.bold: true
+          }
+
+          Row {
+            anchors.right: parent.right
+            anchors.verticalCenter: title.verticalCenter
+            spacing: Style.spacing.sm
+
+            Button {
+              visible: !root.connected
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Reconnect"
+              bordered: true
+              foreground: root.urgent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.reconnect()
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: (root.connected ? "● " : "○ ") + root.statusLine
+              color: root.connected ? root.dim : root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        Flow {
+          width: parent.width
+          spacing: Style.spacing.sm
+
+          Repeater {
+            model: root.rosterProfiles
+            Button {
+              required property var modelData
+              text: (modelData.pinned ? "📌 " : "") + modelData.name + (root.waitingOnUser && root.waitingProfile === modelData.name ? " ?"
+                : root.busyProfiles[modelData.name] ? " …" : root.cronRunning[modelData.name] ? " ⏱" : "")
+              selected: modelData.name === root.selected
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              onClicked: root.selected = modelData.name
+            }
+          }
+
+          Button {
+            text: root.creating ? "× cancel" : "+ new bot"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: {
+              root.creating = !root.creating
+              if (root.creating) Qt.callLater(function() { nameField.forceActiveFocus() })
+            }
+          }
+
+          Button {
+            visible: root.hiddenCount > 0
+            text: root.showHidden ? "Hide hidden" : "Show hidden (" + root.hiddenCount + ")"
+            bordered: true
+            selected: root.showHidden
+            foreground: root.dim
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.showHidden = !root.showHidden
+          }
+        }
+
+        // Model caption on its own line; the action buttons wrap instead of overlapping it.
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+
+          Text {
+            width: parent.width
+            elide: Text.ElideRight
+            text: {
+              root.revision
+              var u = root.usageByProfile[root.selected]
+              return (root.selectedProfile ? "model · " + root.selectedProfile.model : "")
+                + (u ? "  ·  context " + u.contextPercent + "%  ·  " + (u.total >= 1000 ? (u.total / 1000).toFixed(1) + "k" : u.total) + " tokens" : "")
+            }
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Flow {
+            id: botActions
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Button {
+              text: "History"
+              bordered: true
+              selected: root.showingSessions
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.toggleSessions()
+            }
+
+            Button {
+              text: "Routines"
+              bordered: true
+              selected: root.showingRoutines
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.toggleRoutines()
+            }
+
+            Button {
+              text: "Edit"
+              bordered: true
+              selected: root.editing
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.toggleEdit()
+            }
+
+            Button {
+              text: "Screen"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.openScreen()
+            }
+
+            Button {
+              visible: root.selected !== "default"
+              text: root.armedDelete === root.selected ? "Click again to delete @" + root.selected : "Delete @" + root.selected
+              bordered: true
+              foreground: root.armedDelete === root.selected ? root.urgent : root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.requestDelete(root.selected)
+            }
+          }
+        }
+
+        Item {
+          visible: root.screenState !== null
+          width: parent.width
+          implicitHeight: screenActions.implicitHeight
+
+          Text {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "screen · " + root.screenCaption
+            color: root.screenMine ? Color.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            id: screenActions
+            anchors.right: parent.right
+            spacing: Style.spacing.sm
+
+            Button {
+              visible: !root.screenMine
+              text: "Take over"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.screenLease("take")
+            }
+
+            Button {
+              visible: root.screenMine
+              text: "Hand back"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.screenLease("handback")
+            }
+          }
+        }
+
+        Column {
+          visible: root.showingSessions
+          width: parent.width
+          spacing: Style.space(2)
+
+          Text {
+            visible: root.sessionList.length === 0
+            text: "Loading conversations…"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.sessionList.slice(0, 10)
+            Item {
+              required property var modelData
+              width: parent.width
+              implicitHeight: sessionMeta.implicitHeight + Style.space(8)
+
+              Rectangle {
+                anchors.fill: parent
+                radius: Style.cornerRadius
+                color: modelData.current ? root.alpha(root.foreground, 0.14) : "transparent"
+              }
+
+              Text {
+                id: sessionMeta
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: Qt.formatDateTime(new Date(modelData.startedAt * 1000), "MM-dd HH:mm")
+                  + " · " + modelData.messages + " msgs"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(8)
+                anchors.right: sessionMeta.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: (modelData.source === "cron" ? "⏱ " : "") + modelData.title
+                elide: Text.ElideRight
+                wrapMode: Text.NoWrap
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openSession(modelData.id)
+              }
+            }
+          }
+        }
+
+        Column {
+          visible: root.showingRoutines
+          width: parent.width
+          spacing: Style.space(2)
+
+          Text {
+            visible: root.routines.length === 0
+            text: root.routinesLoaded ? "No routines for @" + root.selected : "Loading routines…"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.routines
+            Column {
+              id: routineRow
+              required property var modelData
+              readonly property var runs: { root.revision; return root.routineRunsById[modelData.id] || null }
+              width: parent.width
+              spacing: Style.space(2)
+
+              Item {
+                width: parent.width
+                implicitHeight: routineButtons.implicitHeight + Style.space(4)
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(8)
+                  anchors.right: routineButtons.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: routineRow.modelData.name + " · " + routineRow.modelData.schedule_display
+                    + " · next " + (routineRow.modelData.paused ? "paused" : root.formatWhen(routineRow.modelData.next_run_at))
+                    + " · last " + (routineRow.modelData.last_status || "—")
+                  elide: Text.ElideRight
+                  wrapMode: Text.NoWrap
+                  color: routineRow.modelData.last_status && routineRow.modelData.last_status !== "ok" ? root.urgent
+                    : routineRow.modelData.paused ? root.dim : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Row {
+                  id: routineButtons
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(4)
+
+                  Button {
+                    text: "Runs"
+                    bordered: true
+                    selected: root.routineRunsShown === routineRow.modelData.id
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.toggleRoutineRuns(routineRow.modelData.id)
+                  }
+                  Button {
+                    text: "Run"
+                    bordered: true
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.routineCommand("run", routineRow.modelData.id)
+                  }
+                  Button {
+                    text: routineRow.modelData.paused ? "Resume" : "Pause"
+                    bordered: true
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.routineCommand(routineRow.modelData.paused ? "resume" : "pause", routineRow.modelData.id)
+                  }
+                  Button {
+                    text: root.armedRoutine === routineRow.modelData.id ? "Confirm" : "Delete"
+                    bordered: true
+                    foreground: root.armedRoutine === routineRow.modelData.id ? root.urgent : root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.requestRoutineDelete(routineRow.modelData.id)
+                  }
+                }
+              }
+
+              Text {
+                visible: root.routineRunsShown === routineRow.modelData.id && (routineRow.runs === null || routineRow.runs.length === 0)
+                leftPadding: Style.space(20)
+                text: routineRow.runs === null ? "Loading runs…" : "No runs yet"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Repeater {
+                model: root.routineRunsShown === routineRow.modelData.id && routineRow.runs ? routineRow.runs : []
+                Text {
+                  required property var modelData
+                  width: routineRow.width
+                  leftPadding: Style.space(20)
+                  rightPadding: Style.space(8)
+                  text: root.formatWhen(modelData.started_at) + (modelData.end_reason ? " · " + modelData.end_reason : "")
+                    + (modelData.title ? " · " + modelData.title : "")
+                  elide: Text.ElideRight
+                  wrapMode: Text.NoWrap
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            TextField {
+              id: routineNameField
+              width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.25
+              placeholderText: "name"
+              foreground: root.foreground
+              onAccepted: routineScheduleField.forceActiveFocus()
+            }
+            TextField {
+              id: routineScheduleField
+              width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.25
+              placeholderText: "every 1h"
+              foreground: root.foreground
+              onAccepted: routinePromptField.forceActiveFocus()
+            }
+            TextField {
+              id: routinePromptField
+              width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.5
+              placeholderText: "prompt"
+              foreground: root.foreground
+              onAccepted: root.createRoutine(routineNameField.text, routineScheduleField.text, text)
+            }
+            Button {
+              id: routineCreateButton
+              text: "Create"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.createRoutine(routineNameField.text, routineScheduleField.text, routinePromptField.text)
+            }
+          }
+        }
+
+        Column {
+          visible: root.editing
+          width: parent.width
+          spacing: Style.space(4)
+
+          Text {
+            text: "Description · @" + root.selected + (root.selectedInfo ? "" : " (loading…)")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          TextField {
+            id: editDescField
+            width: parent.width
+            placeholderText: "role / description"
+            foreground: root.foreground
+          }
+
+          Text {
+            text: "SOUL.md"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          ScrollView {
+            width: parent.width
+            height: Style.space(120)
+            clip: true
+
+            TextArea {
+              id: soulArea
+              wrapMode: TextEdit.Wrap
+              placeholderText: "persona / standing instructions"
+              color: root.foreground
+              placeholderTextColor: root.dim
+              selectionColor: root.alpha(Color.accent, 0.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              background: Rectangle {
+                radius: Style.cornerRadius
+                color: root.alpha(root.foreground, 0.06)
+                border.width: 1
+                border.color: root.alpha(root.foreground, soulArea.activeFocus ? 0.5 : 0.2)
+              }
+            }
+          }
+
+          Flow {
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Button {
+              text: "Save"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.saveProfile(editDescField.text, soulArea.text)
+            }
+            Button {
+              text: root.selectedInfo && root.selectedInfo.pinned ? "Pinned" : "Pin"
+              bordered: true
+              selected: root.selectedInfo !== null && root.selectedInfo.pinned === true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.setProfileFlag("pinned", !(root.selectedInfo && root.selectedInfo.pinned))
+            }
+            Button {
+              text: root.selectedInfo && root.selectedInfo.hidden ? "Hidden" : "Hide"
+              bordered: true
+              selected: root.selectedInfo !== null && root.selectedInfo.hidden === true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.setProfileFlag("hidden", !(root.selectedInfo && root.selectedInfo.hidden))
+            }
+            TextField {
+              id: duplicateField
+              width: Style.space(120)
+              placeholderText: "copy name"
+              foreground: root.foreground
+              onAccepted: root.duplicateProfile(text)
+            }
+            Button {
+              text: "Duplicate"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.duplicateProfile(duplicateField.text)
+            }
+          }
+        }
+
+        Flow {
+          visible: root.pickingModel
+          width: parent.width
+          spacing: Style.spacing.sm
+
+          Repeater {
+            model: root.modelPresets
+            Button {
+              required property var modelData
+              text: modelData
+              selected: root.selectedProfile && root.selectedProfile.model === modelData
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.setModel(modelData)
+            }
+          }
+
+          TextField {
+            id: modelField
+            width: Style.space(200)
+            placeholderText: "other model id"
+            foreground: root.foreground
+            onAccepted: { root.setModel(text); text = "" }
+          }
+        }
+
+        Row {
+          visible: root.creating
+          width: parent.width
+          spacing: Style.spacing.sm
+
+          TextField {
+            id: nameField
+            width: parent.width * 0.3
+            placeholderText: "name"
+            foreground: root.foreground
+            onAccepted: descField.forceActiveFocus()
+          }
+          TextField {
+            id: descField
+            width: parent.width * 0.5
+            placeholderText: "role / description"
+            foreground: root.foreground
+            onAccepted: root.createBot()
+          }
+          Button {
+            text: "Create"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.createBot()
+          }
+        }
+
+        Text {
+          visible: root.lastError !== ""
+          width: parent.width
+          text: root.lastError
+          color: root.urgent
+          wrapMode: Text.WordWrap
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        PanelSeparator { foreground: root.foreground }
+      }
+
+      Flickable {
+        id: chatFlick
+        anchors.top: header.bottom
+        anchors.topMargin: Style.space(8)
+        anchors.bottom: footer.top
+        anchors.bottomMargin: Style.space(8)
+        width: parent.width
+        contentWidth: width
+        contentHeight: chatColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        onContentHeightChanged: contentY = Math.max(0, contentHeight - height)
+        // The footer (todo list, cards) grows and shrinks the chat; keep the newest row in view.
+        onHeightChanged: contentY = Math.max(0, contentHeight - height)
+
+        Column {
+          id: chatColumn
+          width: chatFlick.width
+          spacing: Style.space(8)
+
+          Text {
+            visible: root.messages.length === 0
+            width: parent.width
+            topPadding: Style.space(24)
+            text: "Say something to @" + root.selected
+            color: root.dim
+            horizontalAlignment: Text.AlignHCenter
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          Repeater {
+            model: root.messages
+
+            Rectangle {
+              required property var modelData
+              readonly property bool mine: modelData.role === "you"
+              readonly property bool isTool: modelData.role === "tool"
+              readonly property var images: modelData.images || []
+              readonly property var files: modelData.files || []
+              width: isTool ? parent.width
+                : images.length > 0 || files.length > 0 ? parent.width * 0.88
+                : Math.min(parent.width * 0.88, bubbleText.implicitWidth + Style.space(20))
+              x: mine ? parent.width - width : 0
+              implicitHeight: (bubbleText.visible ? bubbleText.implicitHeight : 0) + imageColumn.implicitHeight
+                + Style.space(12)
+              radius: Style.cornerRadius
+              color: isTool ? "transparent" : root.alpha(root.foreground, mine ? 0.14 : 0.06)
+
+              Text {
+                id: bubbleText
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Style.space(6)
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                visible: text !== ""
+                text: modelData.role === "bot" ? root.colorLinks(root.displayText(modelData.text)) : String(modelData.text || "").trim()
+                textFormat: modelData.role === "bot" ? Text.MarkdownText : Text.PlainText
+                wrapMode: Text.Wrap
+                color: isTool ? root.dim : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: isTool ? Style.font.caption : Style.font.bodySmall
+                onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+              }
+
+              Column {
+                id: imageColumn
+                anchors.top: bubbleText.visible ? bubbleText.bottom : parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Style.space(6)
+                spacing: Style.space(6)
+
+                Repeater {
+                  model: images
+
+                  Image {
+                    required property var modelData
+                    width: parent.width
+                    height: Style.space(180)
+                    source: "file://" + modelData
+                    fillMode: Image.PreserveAspectFit
+                    horizontalAlignment: mine ? Image.AlignRight : Image.AlignLeft
+                    asynchronous: true
+                    smooth: true
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: Qt.openUrlExternally("file://" + modelData)
+                    }
+                  }
+                }
+
+                Repeater {
+                  model: files
+
+                  Rectangle {
+                    required property var modelData
+                    width: Math.min(parent.width, fileLabel.implicitWidth + Style.space(16))
+                    height: fileLabel.implicitHeight + Style.space(8)
+                    x: mine ? parent.width - width : 0
+                    radius: Style.cornerRadius
+                    color: root.alpha(root.foreground, 0.10)
+
+                    Text {
+                      id: fileLabel
+                      x: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: parent.width - Style.space(16)
+                      text: "󰈔 " + modelData.name
+                      elide: Text.ElideMiddle
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      enabled: !!modelData.local
+                      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                      onClicked: root.openFile(modelData.local)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      Column {
+        id: footer
+        anchors.bottom: parent.bottom
+        width: parent.width
+        spacing: Style.space(6)
+
+        BorderSurface {
+          visible: root.clarifyQuestion !== null
+          width: parent.width
+          implicitHeight: clarifyColumn.implicitHeight + Style.space(16)
+          color: root.alpha(Color.accent, 0.10)
+          borderSpec: Border.flat(root.alpha(Color.accent, 0.45), 1)
+          radius: Style.cornerRadius
+
+          Column {
+            id: clarifyColumn
+            anchors.fill: parent
+            anchors.margins: Style.space(8)
+            spacing: Style.space(6)
+
+            Text {
+              width: parent.width
+              text: root.clarifyQuestion
+                ? "@" + root.waitingProfile + " asks "
+                  + (root.clarify.questions.length > 1 ? "(" + (root.clarifyIndex + 1) + "/" + root.clarify.questions.length + ") " : "")
+                  + "— "
+                  + root.clarifyQuestion.question
+                : ""
+              color: root.foreground
+              wrapMode: Text.Wrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.sm
+              Repeater {
+                model: root.clarifyQuestion ? root.clarifyQuestion.choices : []
+                Button {
+                  required property var modelData
+                  text: modelData
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  onClicked: root.answerClarify(String(modelData).replace(/ \(Recommended\)$/, ""))
+                }
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.spacing.sm
+              TextField {
+                id: clarifyField
+                width: parent.width - skipButton.width - parent.spacing
+                placeholderText: "Type an answer"
+                foreground: root.foreground
+                onAccepted: root.answerClarify(text)
+              }
+              Button {
+                id: skipButton
+                text: "Skip"
+                bordered: true
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.answerClarify("")
+              }
+            }
+          }
+        }
+
+        BorderSurface {
+          visible: root.approval !== null
+          width: parent.width
+          implicitHeight: approvalColumn.implicitHeight + Style.space(16)
+          color: root.alpha(root.urgent, 0.10)
+          borderSpec: Border.flat(root.alpha(root.urgent, 0.4), 1)
+          radius: Style.cornerRadius
+
+          Column {
+            id: approvalColumn
+            anchors.fill: parent
+            anchors.margins: Style.space(8)
+            spacing: Style.space(6)
+
+            Text {
+              width: parent.width
+              text: root.approval ? ("Approval needed: " + (root.approval.description || root.approval.command)) : ""
+              color: root.foreground
+              wrapMode: Text.Wrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              spacing: Style.spacing.sm
+              Repeater {
+                model: root.approval ? root.approval.choices : []
+                Button {
+                  required property var modelData
+                  text: modelData
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  onClicked: root.answerApproval(modelData)
+                }
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.selectedTodos.length > 0
+          width: parent.width
+          text: root.selectedTodos.slice(0, 8).map(function(t) {
+            return (t.status === "completed" ? "☑ " : t.status === "in_progress" ? "◐ " : t.status === "cancelled" ? "☒ " : "☐ ") + t.text
+          }).join("\n")
+          elide: Text.ElideRight
+          maximumLineCount: 8
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: root.activityLine !== ""
+          width: parent.width
+          text: root.activityLine
+          elide: Text.ElideRight
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+
+          SequentialAnimation on opacity {
+            running: root.activityLine !== ""
+            loops: Animation.Infinite
+            NumberAnimation { from: 1; to: 0.45; duration: 900; easing.type: Easing.InOutQuad }
+            NumberAnimation { from: 0.45; to: 1; duration: 900; easing.type: Easing.InOutQuad }
+          }
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.spacing.sm
+
+          visible: root.pendingImages.length > 0 || root.pendingFiles.length > 0
+
+          Repeater {
+            model: root.pendingImages
+            Image {
+              required property var modelData
+              width: Style.space(44)
+              height: Style.space(44)
+              source: "file://" + modelData
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+            }
+          }
+
+          Repeater {
+            model: root.pendingFiles
+            Rectangle {
+              required property var modelData
+              width: Math.min(Style.space(220), fileLabel.implicitWidth + Style.space(16))
+              height: fileLabel.implicitHeight + Style.space(8)
+              radius: Style.cornerRadius
+              color: root.alpha(root.foreground, 0.10)
+
+              Text {
+                id: fileLabel
+                x: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - Style.space(16)
+                text: "󰈔 " + modelData.name
+                elide: Text.ElideMiddle
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                enabled: !!modelData.local
+                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: root.openFile(modelData.local)
+              }
+            }
+          }
+        }
+
+        Row {
+          visible: root.attachOpen
+          width: parent.width
+          spacing: Style.spacing.sm
+
+          Button {
+            id: pasteButton
+            text: root.attaching ? "Uploading…" : "Paste clipboard"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.attachFrom("clipboard")
+          }
+
+          TextField {
+            id: attachField
+            width: parent.width - pasteButton.width - parent.spacing
+            placeholderText: "or file path (image, pdf, csv, …), then Enter"
+            foreground: root.foreground
+            onAccepted: { if (root.attachFrom(text)) text = "" }
+          }
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.spacing.sm
+
+          TextField {
+            id: input
+            width: parent.width - sendButton.width - modelButton.width - parent.spacing * 2
+              - (root.busy ? steerButton.width + queueButton.width + parent.spacing * 2
+                : newButton.width + imageButton.width + parent.spacing * 2)
+            placeholderText: root.busy ? "Steer @" + root.selected + " (Enter) or Queue for later" : "Message @" + root.selected
+            foreground: root.foreground
+            enabled: root.connected
+            onAccepted: root.submit()
+            Keys.onEscapePressed: root.close()
+          }
+
+          Button {
+            id: imageButton
+            visible: !root.busy
+            text: root.pendingImages.length + root.pendingFiles.length > 0 ? "Attach " + (root.pendingImages.length + root.pendingFiles.length) : "Attach"
+            bordered: true
+            selected: root.attachOpen
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.attachOpen = !root.attachOpen
+          }
+
+          Button {
+            id: modelButton
+            text: "Model"
+            bordered: true
+            selected: root.pickingModel
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.pickingModel = !root.pickingModel
+          }
+
+          Button {
+            id: newButton
+            visible: !root.busy
+            text: "New"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.newChat()
+          }
+
+          Button {
+            id: steerButton
+            visible: root.busy
+            text: "Steer"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: { if (root.steerText(input.text, "steer")) input.text = "" }
+          }
+
+          Button {
+            id: queueButton
+            visible: root.busy
+            text: "Queue"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: { if (root.steerText(input.text, "queue")) input.text = "" }
+          }
+
+          Button {
+            id: sendButton
+            text: root.busy ? "Stop" : "Send"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.busy ? root.sendCommand({ cmd: "interrupt", profile: root.selected }) : root.submit()
+          }
+        }
+      }
+    }
+  }
+}

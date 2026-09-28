@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "puri.hermes",
+  "name": "Hermes Bots",
+  "version": "0.1.0",
+  "author": "puri",
+  "license": "MIT",
+  "description": "Manage and chat with Hermes Agent bots running on a remote Hermes backend.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Hermes Bots",
+    "description": "Bot roster, bot creation, streaming chat and approvals for a remote Hermes backend.",
+    "category": "AI",
+    "aliases": ["hermes", "bots"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
