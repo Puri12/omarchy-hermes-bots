@@ -3,7 +3,7 @@
 Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 봇을 만들고 관리하고 대화하는 플러그인.
 
 - `Panel.qml` — 바 아이콘과 패널 UI (Quickshell, `qs.Ui` 컴포넌트)
-- `hermes-remote.ts` — Bun 헬퍼. 패널과 NDJSON(stdin/stdout)으로 통신하고, `hermes serve`의 REST와 `/api/ws` JSON-RPC에 붙음
+- `hermes-remote.ts` — Bun 헬퍼. 패널과 NDJSON(stdin/stdout)으로 통신하고, `hermes serve`의 REST와 `/api/ws` JSON-RPC에 붙음 (아래 "헬퍼 데몬")
 - `novnc/` — 봇 화면 보기용 noVNC 1.7.0 (MPL-2.0, `novnc/LICENSE.txt`)
 
 ## 기능
@@ -30,6 +30,17 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
    ```
 
 4. 바에 "Hermes Bots" 위젯을 추가하고 `omarchy restart shell`.
+
+## 헬퍼 데몬
+
+바는 패널을 두 개 띄우지만 백엔드 연결은 하나입니다. 패널마다 `hermes-remote.ts stdio` 클라이언트가 돌고, 이 클라이언트가 백그라운드 데몬 `hermes-remote.ts daemon` 하나에 붙습니다. 데몬이 로그인·WebSocket·루틴(cron) 확인·봇 화면 서버를 모두 맡고, 이벤트는 모든 패널에 똑같이 보냅니다(데스크톱 알림은 한 패널만 띄움).
+
+- 소켓: `$XDG_RUNTIME_DIR/puri-hermes.sock` (없으면 `/tmp/puri-hermes-$UID.sock`, 권한 600)
+- PID: `~/.cache/puri.hermes/daemon.pid`, 로그: `~/.cache/puri.hermes/daemon.log`
+- 데몬이 없으면 클라이언트가 띄우고, `omarchy restart shell`을 해도 데몬은 그대로 살아 있습니다.
+- `hermes-remote.ts`가 바뀌면 다음 클라이언트가 옛 데몬을 끄고 새 데몬을 띄웁니다.
+- 패널의 Reconnect(또는 IPC `reconnect`)는 데몬의 로그인과 WebSocket을 새로 맺습니다.
+- 멈추기: `kill "$(cat ~/.cache/puri.hermes/daemon.pid)"` (패널이 열려 있으면 몇 초 뒤 다시 뜹니다. 완전히 멈추려면 위젯을 뺀 뒤 실행)
 
 ## IPC
 

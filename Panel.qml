@@ -111,6 +111,8 @@ Panel {
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
   function notify(title, body, profile, urgency) {
+    // Every panel instance receives the shared daemon's events; only the primary one toasts.
+    if (!primaryClient) return
     if (opened && profile === selected) return
     Quickshell.execDetached(["omarchy-notification-send", "--app-name", "Hermes Bots", "-g", "󰚩", "-u", urgency || "normal",
       title, String(body || "").slice(0, 240), "--exec", "omarchy-shell", "puri.hermes", "show", profile || selected])
@@ -269,6 +271,9 @@ Panel {
       sendCommand({ cmd: "refresh" })
       ensureLoaded(selected)
       break
+    case "role":
+      primaryClient = ev.primary === true
+      break
     case "status":
       connected = true
       lastError = ""
@@ -284,6 +289,11 @@ Panel {
       break
     case "sent":
       sessionOwner[ev.session] = ev.profile
+      // A turn another panel instance started.
+      if (!busyProfiles[ev.profile]) {
+        setBusy(ev.profile, true)
+        setActivity(ev.profile, "thinking")
+      }
       break
     case "steered":
     case "queued":
@@ -329,7 +339,7 @@ Panel {
       break
     case "screen.url":
       screenBase = ev.base
-      if (ev.open) Qt.openUrlExternally(ev.url)
+      if (ev.open && primaryClient) Qt.openUrlExternally(ev.url)
       break
     case "screen":
       screenByProfile[ev.profile] = { running: ev.running, lease: ev.lease, mine: ev.mine }
@@ -889,21 +899,35 @@ Panel {
   Timer { id: routineDisarmTimer; interval: 5000; onTriggered: root.armedRoutine = "" }
   Timer { id: restartTimer; interval: 5000; onTriggered: bridge.running = true }
 
-  // Restart the helper: a fresh login, WebSocket and session resume, whatever state the old one
-  // was stuck in. Transcripts stay; 'ready' reloads the selected bot and refreshes status.
+  // The shared daemon drops its login and WebSocket and logs in again; then this panel's client is
+  // restarted. Transcripts stay; 'ready' reloads the selected bot and refreshes status.
   function reconnect() {
     restartTimer.stop()
     connected = false
     lastError = ""
     statusLine = "Reconnecting…"
     if (bridge.running) {
-      reconnectPending = true
-      bridge.running = false
+      sendCommand({ cmd: "reconnect" })
+      // Give the command time to reach the daemon before the client is stopped.
+      reconnectRestartTimer.restart()
     } else {
       bridge.running = true
     }
   }
+  Timer {
+    id: reconnectRestartTimer
+    interval: 500
+    onTriggered: {
+      if (bridge.running) {
+        root.reconnectPending = true
+        bridge.running = false
+      } else {
+        bridge.running = true
+      }
+    }
+  }
   property bool reconnectPending: false
+  property bool primaryClient: false
   Timer { interval: 60000; running: true; repeat: true; onTriggered: root.sendCommand({ cmd: "refresh" }) }
   Timer { interval: 1000; running: root.anyBusy; repeat: true; onTriggered: root.nowMs = Date.now() }
   Component.onCompleted: bridge.running = true

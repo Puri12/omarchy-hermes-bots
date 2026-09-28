@@ -1,21 +1,25 @@
 #!/usr/bin/env bun
 // Bridge between the Omarchy panel and a remote `hermes serve` backend.
 //
-//   hermes-remote stdio               NDJSON commands on stdin, NDJSON events on stdout
+//   hermes-remote stdio               NDJSON commands on stdin, NDJSON events on stdout (client of the daemon)
+//   hermes-remote daemon              the one long-lived connection, shared by every panel over a Unix socket
 //   hermes-remote status              one-shot status as JSON
 //   hermes-remote chat <profile> <text>   one-shot chat, streams events
 //
 // Credentials: ~/.config/hermes-remote/credentials.env
 //   HERMES_REMOTE_URL, HERMES_REMOTE_USER, HERMES_REMOTE_PASSWORD
 
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, openSync, closeSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, closeSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Socket } from "node:net";
 import { normalize } from "node:path";
 import type { ServerWebSocket } from "bun";
 
 type Json = Record<string, unknown>;
 type Command =
   | { cmd: "refresh" }
+  | { cmd: "reconnect" }
   | { cmd: "create"; name: string; description?: string }
   | { cmd: "delete"; name: string }
   | { cmd: "profile.get"; profile: string }
@@ -59,6 +63,10 @@ const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`/g;
 const IMAGE_PATH_RE = /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i;
 const CRON_POLL_MS = 30000;
 const NOVNC_DIR = `${import.meta.dir}/novnc`;
+const SOCKET_PATH = process.env.XDG_RUNTIME_DIR
+  ? `${process.env.XDG_RUNTIME_DIR}/puri-hermes.sock` : `/tmp/puri-hermes-${process.getuid?.() ?? 0}.sock`;
+const DAEMON_PID = `${cacheDir}/daemon.pid`;
+const DAEMON_LOG = `${cacheDir}/daemon.log`;
 
 // Served by the helper on 127.0.0.1; its RFB socket is spliced to the gateway display bridge.
 const SCREEN_HTML = `<!doctype html>
@@ -130,8 +138,7 @@ setInterval(refresh, 2000);
 </body></html>
 `;
 
-// Two bar-widget instances each run a helper; an exclusive-create marker per cron run makes
-// exactly one of them raise the desktop notification.
+// An exclusive-create marker per cron run: a run is announced once, also across daemon restarts.
 function claimOnce(dir: string, key: string): boolean {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try {
@@ -237,7 +244,8 @@ async function loadCredentials() {
   return { url: url.replace(/\/$/, ""), user, password };
 }
 
-const emit = (ev: Json) => process.stdout.write(`${JSON.stringify(ev)}\n`);
+// In daemon mode this becomes a broadcast to every connected panel.
+let emit = (ev: Json) => { process.stdout.write(`${JSON.stringify(ev)}\n`); };
 
 class Remote {
   private cookie = "";
@@ -314,6 +322,10 @@ class Remote {
       ws.onclose = (e) => {
         this.ws = null;
         this.sessionByProfile.clear();
+        this.keyByProfile.clear();
+        // Calls still waiting on this socket never get a reply; fail them so the daemon's queue moves on.
+        for (const settle of this.pending.values()) settle({ error: { message: "websocket closed" } });
+        this.pending.clear();
         // viewer_id is only honored on the gateway connection that minted it.
         this.viewerByProfile.clear();
         emit({ ev: "disconnected", code: e.code });
@@ -472,19 +484,36 @@ class Remote {
 
   async load(profile: string) {
     await this.requireProfile(profile);
-    if (this.sessionByProfile.has(profile)) return;
-    const recent = await this.rpc("session.most_recent", this.profileParam(profile));
-    const stored = recent.session_id ? String(recent.session_id) : "";
-    if (!stored) {
-      emit({ ev: "history", profile, session: "", messages: [] });
-      return;
+    // A panel that (re)connects to the long-lived daemon needs the conversation the daemon already
+    // holds; resuming its stored key reattaches the live session and returns its messages.
+    const live = this.sessionByProfile.get(profile);
+    const key = live ? this.keyByProfile.get(profile) : undefined;
+    if (live && !key) return emit({ ev: "history", profile, session: live, messages: [] });
+    let stored = key ?? "";
+    let title = "";
+    if (!key) {
+      const recent = await this.rpc("session.most_recent", this.profileParam(profile));
+      stored = recent.session_id ? String(recent.session_id) : "";
+      title = String(recent.title ?? "");
+      if (!stored) {
+        emit({ ev: "history", profile, session: "", messages: [] });
+        return;
+      }
     }
-    const r = await this.rpc("session.resume", { session_id: stored, cols: 100, ...this.profileParam(profile) });
+    let r: Json;
+    try {
+      r = await this.rpc("session.resume", { session_id: stored, cols: 100, ...this.profileParam(profile) });
+    } catch (e) {
+      // A fresh chat has no stored row until its first turn.
+      if (live) return emit({ ev: "history", profile, session: live, messages: [] });
+      throw e;
+    }
     const sid = String(r.session_id);
     this.sessionByProfile.set(profile, sid);
-    this.storedByProfile.set(profile, stored);
+    this.keyByProfile.set(profile, stored);
+    if (!key) this.storedByProfile.set(profile, stored);
     const messages = ((r.messages as Json[]) ?? []).map(historyRow).filter((x): x is HistoryRow => x !== null);
-    emit({ ev: "history", profile, session: sid, title: String(recent.title ?? ""), messages });
+    emit({ ev: "history", profile, session: sid, title, messages });
     for (const m of messages) if (m.role === "bot") void this.fetchMedia(sid, profile, m.text);
   }
 
@@ -594,6 +623,7 @@ class Remote {
     const r = await this.rpc("session.create", { cols: 100, source: "desktop", ...this.profileParam(profile) });
     const sid = String(r.session_id);
     this.sessionByProfile.set(profile, sid);
+    this.keyByProfile.set(profile, String(r.stored_session_id ?? ""));
     this.storedByProfile.delete(profile);
     this.pendingRefs.delete(profile);
     emit({ ev: "session", profile, session: sid, model: (r.info as Json | undefined)?.model ?? "" });
@@ -661,12 +691,29 @@ class Remote {
   // Live session ids differ from the stored ids session.list returns; remember which stored
   // conversation each bot is showing so the History list can mark it.
   private storedByProfile = new Map<string, string>();
+  // Stored key of each live session (also for a new chat), used to reattach it for a reconnecting panel.
+  private keyByProfile = new Map<string, string>();
+
+  // Panel Reconnect: a fresh login and gateway WebSocket, whatever state the old ones were stuck in.
+  async reconnect() {
+    this.cookie = "";
+    const ws = this.ws;
+    if (ws) {
+      await new Promise<void>((resolve) => {
+        ws.addEventListener("close", () => resolve(), { once: true });
+        setTimeout(resolve, 3000);
+        ws.close();
+      });
+    }
+    emit(await this.status());
+  }
 
   async openSession(profile: string, session: string) {
     await this.requireProfile(profile);
     const r = await this.rpc("session.resume", { session_id: session, cols: 100, ...this.profileParam(profile) });
     const sid = String(r.session_id);
     this.sessionByProfile.set(profile, sid);
+    this.keyByProfile.set(profile, session);
     this.storedByProfile.set(profile, session);
     this.pendingRefs.delete(profile);
     const messages = ((r.messages as Json[]) ?? []).map(historyRow).filter((x): x is HistoryRow => x !== null);
@@ -1012,6 +1059,7 @@ class Remote {
   async handle(c: Command) {
     switch (c.cmd) {
       case "refresh": return emit(await this.status());
+      case "reconnect": return this.reconnect();
       case "create": return this.create(c.name, c.description);
       case "delete": return this.remove(c.name);
       case "profile.get": return this.profileGet(c.profile);
@@ -1063,8 +1111,180 @@ class Remote {
   }
 }
 
+// Identifies the code a daemon runs, so a client from an updated plugin replaces an older daemon.
+const ownVersion = async () => createHash("sha1").update(await Bun.file(import.meta.path).bytes()).digest("hex").slice(0, 12);
+
+function dial(): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection(SOCKET_PATH);
+    sock.once("error", reject);
+    sock.once("connect", () => {
+      sock.off("error", reject);
+      sock.setEncoding("utf8");
+      resolve(sock);
+    });
+  });
+}
+
+function spawnDaemon() {
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  const log = openSync(DAEMON_LOG, "a");
+  // The lock serializes racing starts (both panels at once, or an update while the old daemon still exits);
+  // the loser gives up and its client connects to the winner.
+  spawn("sh", ["-c", 'exec 9>"$2"; flock -w 5 9 || exit 0; exec "$0" "$1" daemon',
+    process.execPath, import.meta.path, `${SOCKET_PATH}.lock`], { detached: true, stdio: ["ignore", log, log] }).unref();
+  closeSync(log);
+}
+
+// Connects (starting the daemon if needed) and reads its greeting; the socket is left paused after it.
+async function attachDaemon(): Promise<{ sock: Socket; ready: Json; rest: string }> {
+  let sock = await dial().catch(() => null);
+  if (!sock) {
+    spawnDaemon();
+    const deadline = Date.now() + 5000;
+    while (!sock && Date.now() < deadline) {
+      await Bun.sleep(100);
+      sock = await dial().catch(() => null);
+    }
+    if (!sock) throw new RemoteError(`helper daemon did not start (see ${DAEMON_LOG})`);
+  }
+  const conn = sock;
+  return new Promise((resolve, reject) => {
+    let buf = "";
+    const onClose = () => reject(new RemoteError("helper daemon closed the connection"));
+    const onData = (chunk: string) => {
+      buf += chunk;
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      conn.pause();
+      conn.off("data", onData);
+      conn.off("close", onClose);
+      try {
+        resolve({ sock: conn, ready: JSON.parse(buf.slice(0, nl)) as Json, rest: buf.slice(nl + 1) });
+      } catch (e) {
+        reject(e);
+      }
+    };
+    conn.on("data", onData);
+    conn.on("close", onClose);
+  });
+}
+
+// What Panel.qml runs: a pipe between the panel and the shared daemon, same NDJSON both ways.
+async function client() {
+  await loadCredentials(); // report a missing credentials file in the panel, not only in the daemon log
+  const version = await ownVersion();
+  let { sock, ready, rest } = await attachDaemon();
+  if (ready.version !== version) {
+    sock.write(`${JSON.stringify({ cmd: "shutdown" })}\n`);
+    const deadline = Date.now() + 5000;
+    while (existsSync(SOCKET_PATH) && Date.now() < deadline) await Bun.sleep(100);
+    sock.destroy();
+    ({ sock, ready, rest } = await attachDaemon());
+    if (ready.version !== version) throw new RemoteError(`helper daemon runs ${ready.version}, expected ${version}`);
+  }
+  process.stdout.write(`${JSON.stringify(ready)}\n${rest}`);
+  sock.on("data", (chunk: string) => { process.stdout.write(chunk); });
+  sock.on("error", () => {});
+  // Exit non-zero so the panel's restart timer relaunches the client (and with it a daemon).
+  sock.on("close", () => {
+    process.stderr.write("helper daemon closed the connection\n");
+    process.exit(1);
+  });
+  sock.resume();
+  for await (const line of console) if (line.trim()) sock.write(`${line}\n`);
+  process.exit(0);
+}
+
+async function daemon(remote: Remote) {
+  const version = await ownVersion();
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  if (existsSync(SOCKET_PATH)) {
+    if (await dial().then((s) => { s.destroy(); return true; }, () => false)) {
+      process.stderr.write("another hermes-remote daemon is already listening\n");
+      process.exit(0);
+    }
+    rmSync(SOCKET_PATH, { force: true });
+  }
+  const clients = new Set<Socket>();
+  const send = (sock: Socket, ev: Json) => sock.write(`${JSON.stringify(ev)}\n`);
+  // Cron reports that land while no panel is connected (a shell restart) go to the next one.
+  const backlog: Json[] = [];
+  emit = (ev: Json) => {
+    if (clients.size === 0) {
+      if (ev.ev === "cron") backlog.push(ev);
+      return;
+    }
+    for (const c of clients) send(c, ev);
+  };
+  const run = (c: Command) => remote.handle(c)
+    .catch((e) => emit({ ev: "error", message: e instanceof Error ? e.message : String(e) }));
+  let queue: Promise<unknown> = Promise.resolve();
+  const server = createServer((sock) => {
+    sock.setEncoding("utf8");
+    send(sock, { ev: "ready", version });
+    // Every panel instance gets every event; only the oldest one raises desktop notifications.
+    send(sock, { ev: "role", primary: clients.size === 0 });
+    clients.add(sock);
+    for (const ev of backlog.splice(0)) send(sock, ev);
+    let buf = "";
+    sock.on("data", (chunk: string) => {
+      buf += chunk;
+      for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let c: Command;
+        try {
+          c = JSON.parse(line) as Command;
+        } catch (e) {
+          emit({ ev: "error", message: e instanceof Error ? e.message : String(e) });
+          continue;
+        }
+        if ((c as { cmd: string }).cmd === "shutdown") return shutdown();
+        // Out of band: a reconnect must be able to unstick a command waiting on a dead socket.
+        if (c.cmd === "reconnect") void run(c);
+        else queue = queue.then(() => run(c));
+      }
+    });
+    sock.on("error", () => {});
+    sock.on("close", () => {
+      const wasPrimary = clients.values().next().value === sock;
+      clients.delete(sock);
+      const next = clients.values().next().value;
+      if (wasPrimary && next) send(next, { ev: "role", primary: true });
+    });
+  });
+  function shutdown() {
+    server.close();
+    rmSync(SOCKET_PATH, { force: true });
+    rmSync(DAEMON_PID, { force: true });
+    process.exit(0);
+  }
+  server.on("error", (e) => {
+    process.stderr.write(`daemon socket error: ${e.message}\n`);
+    process.exit(1);
+  });
+  const umask = process.umask(0o077);
+  server.listen(SOCKET_PATH, () => {
+    process.umask(umask);
+    chmodSync(SOCKET_PATH, 0o600);
+    writeFileSync(DAEMON_PID, `${process.pid}\n`);
+    process.stderr.write(`${new Date().toISOString()} daemon ${version} listening on ${SOCKET_PATH} (pid ${process.pid})\n`);
+  });
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+  // Nobody can reach a daemon whose socket file is gone, and it would hold the start lock forever.
+  setInterval(() => { if (!existsSync(SOCKET_PATH)) shutdown(); }, 10000);
+  const pollCron = () => remote.pollCron()
+    .catch((e) => process.stderr.write(`cron poll failed: ${e instanceof Error ? e.message : String(e)}\n`))
+    .finally(() => setTimeout(pollCron, CRON_POLL_MS));
+  void pollCron();
+}
+
 async function main() {
   const [mode = "stdio", ...rest] = process.argv.slice(2);
+  if (mode === "stdio") return client();
   const remote = new Remote(await loadCredentials());
   if (mode === "status") return console.log(JSON.stringify(await remote.status()));
   if (mode === "chat") {
@@ -1081,19 +1301,8 @@ async function main() {
     await finished;
     process.exit(0);
   }
-  emit({ ev: "ready" });
-  const pollCron = () => remote.pollCron()
-    .catch((e) => process.stderr.write(`cron poll failed: ${e instanceof Error ? e.message : String(e)}\n`))
-    .finally(() => setTimeout(pollCron, CRON_POLL_MS));
-  void pollCron();
-  for await (const line of console) {
-    if (!line.trim()) continue;
-    try {
-      await remote.handle(JSON.parse(line) as Command);
-    } catch (e) {
-      emit({ ev: "error", message: e instanceof Error ? e.message : String(e) });
-    }
-  }
+  if (mode === "daemon") return daemon(remote);
+  throw new RemoteError(`unknown mode: ${mode}`);
 }
 
 main().catch((e) => {
