@@ -42,6 +42,7 @@ Panel {
   property int revision: 0
   property var activityByProfile: ({})
   property var todosByProfile: ({})
+  property var unreadProfiles: ({})
   property var usageByProfile: ({})
   readonly property var selectedTodos: { revision; return todosByProfile[selected] || [] }
   property var cronRunning: ({})
@@ -125,6 +126,11 @@ Panel {
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
   function notify(title, body, profile, urgency) {
+    // Something happened on a bot the user is not looking at: mark it unread in the roster.
+    if (profile && profile !== selected && !unreadProfiles[profile]) {
+      unreadProfiles[profile] = true
+      revision++
+    }
     // Every panel instance receives the shared daemon's events; only the primary one toasts.
     if (!primaryClient) return
     if (opened && profile === selected) return
@@ -151,6 +157,10 @@ Panel {
   }
 
   onSelectedChanged: {
+    if (unreadProfiles[selected]) {
+      delete unreadProfiles[selected]
+      revision++
+    }
     showingSessions = false
     routineRunsShown = ""
     armedRoutine = ""
@@ -958,6 +968,7 @@ Panel {
       return JSON.stringify({ profile: root.selected, loaded: root.routinesLoaded, jobs: root.routines, error: root.lastError })
     }
     // Returns the cached list for the selected bot and asks the helper for a fresh one.
+    function unread(): string { return JSON.stringify(root.unreadProfiles) }
     function skills(): string {
       root.refreshSkills()
       return JSON.stringify({ profile: root.selected, skills: root.selectedSkills })
@@ -1175,8 +1186,10 @@ Panel {
             model: root.rosterProfiles
             Button {
               required property var modelData
-              text: (modelData.pinned ? "📌 " : "") + modelData.name + (root.waitingOnUser && root.waitingProfile === modelData.name ? " ?"
-                : root.busyProfiles[modelData.name] ? " …" : root.cronRunning[modelData.name] ? " ⏱" : "")
+              // root.revision: the status maps are mutated in place, so re-evaluate on every revision bump.
+              text: (root.revision, (modelData.pinned ? "📌 " : "") + modelData.name) + (root.waitingOnUser && root.waitingProfile === modelData.name ? " ?"
+                : root.busyProfiles[modelData.name] ? " …" : root.cronRunning[modelData.name] ? " ⏱"
+                : root.unreadProfiles[modelData.name] ? " •" : "")
               selected: modelData.name === root.selected
               bordered: true
               foreground: root.foreground
