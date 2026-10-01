@@ -29,6 +29,7 @@ type Command =
   | { cmd: "dictate.start" }
   | { cmd: "dictate.stop"; profile: string }
   | { cmd: "dictate.file"; profile: string; path: string }
+  | { cmd: "demo.start" | "demo.stop"; profile: string }
   | { cmd: "groups" }
   | { cmd: "group.create"; name: string; members: string[] }
   | { cmd: "group.open"; room: string }
@@ -245,6 +246,128 @@ function errorDetail(detail: unknown): string {
     return d.error + saved;
   }
   return String(detail);
+}
+
+// Teach by demonstration: the RFB input a person sends while holding the Bot Screen, as readable steps.
+const MODIFIER_KEYS: Record<number, string> = {
+  0xffe1: "Shift", 0xffe2: "Shift", 0xffe3: "Ctrl", 0xffe4: "Ctrl", 0xffe7: "Alt", 0xffe8: "Alt",
+  0xffe9: "Alt", 0xffea: "Alt", 0xffeb: "Super", 0xffec: "Super" };
+const KEY_NAMES: Record<number, string> = {
+  0xff0d: "Enter", 0xff8d: "Enter", 0xff09: "Tab", 0xff08: "Backspace", 0xff1b: "Escape", 0xffff: "Delete",
+  0xff50: "Home", 0xff57: "End", 0xff55: "PageUp", 0xff56: "PageDown", 0xff63: "Insert",
+  0xff51: "Left", 0xff52: "Up", 0xff53: "Right", 0xff54: "Down",
+  ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [0xffbe + i, `F${i + 1}`])) };
+const DEMO_MAX_STEPS = 200;
+
+function keysymChar(sym: number): string | null {
+  if ((sym >= 0x20 && sym <= 0x7e) || (sym >= 0xa0 && sym <= 0xff)) return String.fromCharCode(sym);
+  if (sym >= 0x01000100 && sym <= 0x0110ffff) return String.fromCodePoint(sym - 0x01000000);
+  return null;
+}
+
+class DemoRecorder {
+  private steps: string[] = [];
+  private typed = "";
+  private mods = new Set<string>();
+  private mask = 0;
+  private press: { x: number; y: number } | null = null;
+  private lastClick: { x: number; y: number; t: number } | null = null;
+  private scroll: { dir: string; n: number; x: number; y: number } | null = null;
+
+  // noVNC flushes every client message as its own WebSocket frame, so one frame is one message.
+  // Handshake frames and the other message types never match these exact shapes.
+  feed(frame: Uint8Array, now = Date.now()) {
+    const v = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    if (frame.length === 8 && frame[0] === 4) this.key(frame[1] !== 0, v.getUint32(4));
+    else if (frame.length === 12 && frame[0] === 255 && frame[1] === 0) this.key(v.getUint16(2) !== 0, v.getUint32(4));
+    else if (frame.length === 6 && frame[0] === 5) this.pointer(frame[1], v.getUint16(2), v.getUint16(4), now);
+  }
+
+  finish(): string[] {
+    this.flush();
+    return this.steps;
+  }
+
+  private push(step: string) {
+    if (this.steps.length < DEMO_MAX_STEPS) this.steps.push(step);
+  }
+
+  private flush() {
+    if (this.typed) this.push(`type ${JSON.stringify(this.typed)}`);
+    if (this.scroll) this.push(`scroll ${this.scroll.dir} ${this.scroll.n}x at (${this.scroll.x}, ${this.scroll.y})`);
+    this.typed = "";
+    this.scroll = null;
+  }
+
+  private chord(name: string, keepShift: boolean) {
+    return [...[...this.mods].filter((m) => keepShift || m !== "Shift"), name].join("+");
+  }
+
+  private key(down: boolean, sym: number) {
+    const mod = MODIFIER_KEYS[sym];
+    if (mod) {
+      if (down) this.mods.add(mod);
+      else this.mods.delete(mod);
+      return;
+    }
+    if (!down) return;
+    const ch = keysymChar(sym);
+    const plain = [...this.mods].every((m) => m === "Shift");
+    if (ch && plain) {
+      if (this.scroll) this.flush();
+      this.typed += ch;
+      return;
+    }
+    if (sym === 0xff08 && plain && this.typed) {
+      this.typed = this.typed.slice(0, -1);
+      return;
+    }
+    this.flush();
+    this.push(`press ${this.chord(ch ? ch.toUpperCase() : KEY_NAMES[sym] ?? `key 0x${sym.toString(16)}`, !ch)}`);
+  }
+
+  private pointer(mask: number, x: number, y: number, now: number) {
+    const prev = this.mask;
+    const pressed = (bit: number) => (mask & bit) !== 0 && (prev & bit) === 0;
+    const released = (bit: number) => (mask & bit) === 0 && (prev & bit) !== 0;
+    this.mask = mask;
+    for (const [bit, dir] of [[8, "up"], [16, "down"]] as const) {
+      if (!pressed(bit)) continue;
+      if (this.scroll?.dir === dir) this.scroll.n++;
+      else {
+        this.flush();
+        this.scroll = { dir, n: 1, x, y };
+      }
+    }
+    if (pressed(1)) {
+      this.flush();
+      this.press = { x, y };
+    }
+    if (released(1) && this.press) {
+      const from = this.press;
+      this.press = null;
+      const last = this.lastClick;
+      if (Math.hypot(x - from.x, y - from.y) > 8) {
+        this.push(`drag from (${from.x}, ${from.y}) to (${x}, ${y})`);
+        this.lastClick = null;
+      } else if (last && now - last.t < 450 && Math.hypot(x - last.x, y - last.y) <= 8
+          && this.steps.at(-1)?.endsWith(`click at (${last.x}, ${last.y})`)) {
+        this.steps[this.steps.length - 1] = `${this.chord("double-click", true)} at (${x}, ${y})`;
+        this.lastClick = null;
+      } else {
+        this.push(`${this.chord("click", true)} at (${x}, ${y})`);
+        this.lastClick = { x, y, t: now };
+      }
+    }
+    if (pressed(4)) {
+      this.flush();
+      this.push(`${this.chord("right-click", true)} at (${x}, ${y})`);
+    }
+    if (pressed(2)) {
+      this.flush();
+      this.push(`${this.chord("middle-click", true)} at (${x}, ${y})`);
+    }
+  }
 }
 
 // One hosted-room log event as a panel row; turn bookkeeping (started/settled/activity) is dropped.
@@ -1268,6 +1391,7 @@ class Remote {
           open: (ws) => { void this.openRfb(ws); },
           message: (ws, msg) => {
             const link = ws.data as RfbLink;
+            this.demoByProfile.get(link.profile)?.feed(typeof msg === "string" ? new TextEncoder().encode(msg) : new Uint8Array(msg));
             if (link.upstream?.readyState === WebSocket.OPEN) link.upstream.send(msg);
             else link.backlog.push(msg);
           },
@@ -1282,6 +1406,24 @@ class Remote {
       });
     }
     return `http://127.0.0.1:${this.screenServer.port}`;
+  }
+
+  // A demonstration records the input this helper relays to the bot's screen while the person holds it.
+  private demoByProfile = new Map<string, DemoRecorder>();
+
+  async demoStart(profile: string) {
+    const s = await this.screenLease(profile, "take");
+    if (!s.mine) throw new RemoteError(`could not take over @${profile}'s screen`);
+    this.demoByProfile.set(profile, new DemoRecorder());
+    emit({ ev: "demo", profile, recording: true });
+  }
+
+  async demoStop(profile: string) {
+    const steps = this.demoByProfile.get(profile)?.finish() ?? [];
+    this.demoByProfile.delete(profile);
+    emit({ ev: "demo", profile, recording: false, steps });
+    // Closing the screen page already hands control back; only a still-held screen needs releasing.
+    if (this.screenByProfile.get(profile)?.mine) await this.screenLease(profile, "handback");
   }
 
   // Group chats are hosted rooms on the gateway. The log has no push events, so the room a panel
@@ -1412,6 +1554,8 @@ class Remote {
       case "dictate.start": return this.dictateStart();
       case "dictate.stop": return this.dictateStop(c.profile);
       case "dictate.file": return this.transcribe(c.profile, c.path);
+      case "demo.start": return this.demoStart(c.profile);
+      case "demo.stop": return this.demoStop(c.profile);
       case "groups": return this.groupCommand("", () => this.groups());
       case "group.create": return this.groupCommand("", () => this.groupCreate(c.name, c.members));
       case "group.open": return this.groupCommand(c.room, () => this.groupOpen(c.room));

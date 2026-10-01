@@ -168,6 +168,10 @@ Panel {
   readonly property bool busy: { revision; return busyProfiles[selected] === true }
   readonly property var screenState: { revision; return screenByProfile[selected] || null }
   readonly property bool screenMine: screenState !== null && screenState.mine === true
+  // Teach by demonstration: the bot being recorded, the bot whose next reply is a skill draft, and that draft.
+  property string demoProfile: ""
+  property string teachProfile: ""
+  property var skillDraft: null
   readonly property string screenCaption: !screenState ? ""
     : !screenState.running ? "screen off"
     : screenMine ? "you have control"
@@ -455,6 +459,23 @@ Panel {
       screenByProfile[ev.profile] = { running: ev.running, lease: ev.lease, mine: ev.mine }
       revision++
       break
+    case "demo":
+      if (ev.recording) {
+        demoProfile = ev.profile
+      } else {
+        demoProfile = ""
+        if (ev.steps.length === 0) lastError = "no demonstration steps were recorded"
+        else if (busyProfiles[ev.profile]) lastError = "@" + ev.profile + " is busy; the demonstration was not sent"
+        else {
+          teachProfile = ev.profile
+          sendTextForProfile(ev.profile, teachPrompt(ev.steps), [], [])
+        }
+      }
+      break
+    case "skillSaved":
+      pushMessage(ev.profile, "tool", "🎓 skill saved: /" + ev.name)
+      if (skillDraft && skillDraft.profile === ev.profile && skillDraft.name === ev.name) skillDraft = null
+      break
     case "screen.error":
       lastError = "@" + ev.profile + " screen: " + ev.message
       break
@@ -660,6 +681,16 @@ Panel {
         if (!streamed) pushMessage(owner, "bot", finished)
         notify("@" + owner + " replied", displayText(finished), owner)
       }
+      if (teachProfile === owner) {
+        teachProfile = ""
+        var draft = parseSkillDraft(finished)
+        if (draft) {
+          draft.profile = owner
+          skillDraft = draft
+        } else if (finished !== "") {
+          lastError = "@" + owner + " did not reply with a SKILL.md to save"
+        }
+      }
       setBusy(owner, false)
       clearActivity(owner)
       break
@@ -710,6 +741,7 @@ Panel {
       break
     case "error":
       lastError = ev.message
+      if (skillDraft && skillDraft.saving) skillDraft = Object.assign({}, skillDraft, { saving: false, error: ev.message })
       attaching = false
       var failed = ev.profile || (ev.session ? profileForSession(ev.session) : selected)
       if (clearingProfiles[failed]) {
@@ -912,6 +944,50 @@ Panel {
   function screenLease(op) {
     lastError = ""
     sendCommand({ cmd: op === "take" ? "screen.take" : "screen.handback", profile: selected })
+  }
+
+  // The page is where the person demonstrates; the helper records what it relays to the bot's screen.
+  function startDemo() {
+    openScreen()
+    sendCommand({ cmd: "demo.start", profile: selected })
+  }
+
+  function stopDemo() {
+    sendCommand({ cmd: "demo.stop", profile: demoProfile || selected })
+  }
+
+  function teachPrompt(steps) {
+    return "I just demonstrated a task on your Bot Desktop while I had control of the screen. "
+      + "My inputs, in order (screen pixel coordinates):\n"
+      + steps.map(function(s, i) { return (i + 1) + ". " + s }).join("\n")
+      + "\n\nTurn this into a reusable skill so you can do the task yourself with your computer tools. "
+      + "Infer the goal from the steps (take a screenshot if it helps), find on-screen elements by what they show "
+      + "rather than by fixed coordinates, and say what to check after each step. Reply with only the SKILL.md: "
+      + "YAML front matter with name (lowercase-with-dashes) and description (one sentence of at most 60 characters, "
+      + "trigger first, ending with a period), then the instructions."
+  }
+
+  // The draft is the reply's SKILL.md, fenced or not: front matter with a name, then the body.
+  function parseSkillDraft(text) {
+    var body = String(text || "")
+    var start = body.search(/^---\s*$/m)
+    if (start < 0) return null
+    // Drop the closing fence only when the whole SKILL.md was wrapped in one.
+    var fenced = /```[A-Za-z]*[ \t]*\n\s*$/.test(body.slice(0, start))
+    body = body.slice(start).trim()
+    if (fenced) body = body.replace(/\n```\s*$/, "")
+    var close = body.indexOf("\n---", 3)
+    var name = body.match(/^name:\s*["']?([A-Za-z0-9][A-Za-z0-9_.-]*)["']?\s*$/m)
+    if (close < 0 || !name || name.index > close) return null
+    return { name: name[1], content: body + "\n" }
+  }
+
+  function saveSkillDraft() {
+    if (!skillDraft) return false
+    sendCommand({ cmd: "skill.save", profile: skillDraft.profile, name: skillDraft.name, content: skillDraft.content })
+    // Kept until the helper confirms, so a rejected draft (the server validates it) stays visible with the reason.
+    skillDraft = Object.assign({}, skillDraft, { saving: true, error: "" })
+    return true
   }
 
   function attachFrom(source) {
@@ -1269,6 +1345,15 @@ Panel {
     // Opens the Edit section the same way its button does; used for captures.
     function editView(): string { if (!root.editing) root.toggleEdit(); return "shown" }
     function screenTake(): string { root.screenLease("take"); return "taking" }
+    // Test hooks: record without opening the screen page, and inspect or save the resulting draft.
+    function demoStart(): string { root.sendCommand({ cmd: "demo.start", profile: root.selected }); return "starting" }
+    function demoStop(): string { root.stopDemo(); return "stopping" }
+    function demoState(): string {
+      return JSON.stringify({ recording: root.demoProfile, teaching: root.teachProfile, error: root.lastError,
+        draft: root.skillDraft ? { profile: root.skillDraft.profile, name: root.skillDraft.name, length: root.skillDraft.content.length,
+          saving: root.skillDraft.saving === true, error: root.skillDraft.error || "" } : null })
+    }
+    function saveSkillDraft(): string { return root.saveSkillDraft() ? "saving" : "no-draft" }
     function screenHandback(): string { root.screenLease("handback"); return "handing-back" }
     function screenState(): string {
       var s = root.screenState
@@ -1627,7 +1712,7 @@ Panel {
           Text {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
-            text: "screen · " + root.screenCaption
+            text: "screen · " + root.screenCaption + (root.demoProfile === root.selected ? " · ● recording demo" : "")
             color: root.screenMine ? Color.accent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1637,6 +1722,26 @@ Panel {
             id: screenActions
             anchors.right: parent.right
             spacing: Style.spacing.sm
+
+            Button {
+              visible: root.screenState !== null && root.screenState.running && root.demoProfile !== root.selected
+              text: "● Record demo"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.startDemo()
+            }
+
+            Button {
+              visible: root.demoProfile === root.selected
+              text: "■ Stop & teach"
+              bordered: true
+              foreground: root.urgent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.stopDemo()
+            }
 
             Button {
               visible: !root.screenMine
@@ -1656,6 +1761,50 @@ Panel {
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               onClicked: root.screenLease("handback")
+            }
+          }
+        }
+
+        Item {
+          visible: root.skillDraft !== null && root.skillDraft.profile === root.selected
+          width: parent.width
+          implicitHeight: draftActions.implicitHeight
+
+          Text {
+            anchors.left: parent.left
+            anchors.right: draftActions.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            elide: Text.ElideRight
+            text: !root.skillDraft ? "" : root.skillDraft.error ? "⚠ /" + root.skillDraft.name + ": " + root.skillDraft.error
+              : "🎓 skill draft from your demo: /" + root.skillDraft.name
+            color: root.skillDraft && root.skillDraft.error ? root.urgent : Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            id: draftActions
+            anchors.right: parent.right
+            spacing: Style.spacing.sm
+
+            Button {
+              text: root.skillDraft && root.skillDraft.saving ? "Saving…" : "Save skill"
+              enabled: !root.skillDraft || !root.skillDraft.saving
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.saveSkillDraft()
+            }
+
+            Button {
+              text: "Dismiss"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.skillDraft = null
             }
           }
         }
