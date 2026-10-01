@@ -122,7 +122,9 @@ Panel {
   property string openRoom: ""
   property var roomRows: []
   property bool roomWorking: false
-  property int roomPending: 0
+  // Driver pending actions of the open room: member approvals and turns that need an explicit retry.
+  property var roomActions: []
+  property var roomSeenRequests: ({})
   property string roomError: ""
   property var newGroupMembers: ({})
   property string armedDisband: ""
@@ -502,14 +504,21 @@ Panel {
       openRoom = ev.room
       roomRows = []
       roomWorking = false
-      roomPending = 0
+      roomActions = []
       roomError = ""
       break
     case "group.log":
       if (ev.room !== openRoom) break
       if (ev.rows.length > 0) roomRows = roomRows.concat(ev.rows).slice(-150)
       roomWorking = ev.working === true
-      roomPending = ev.pending || 0
+      roomActions = ev.actions || []
+      for (var ai = 0; ai < roomActions.length; ai++) {
+        var act = roomActions[ai]
+        if (act.kind !== "approval" || roomSeenRequests[act.requestId]) continue
+        roomSeenRequests[act.requestId] = true
+        notify("@" + act.member + " needs approval in " + (openRoomInfo ? openRoomInfo.name : "a group"),
+          act.description || act.command, "", "critical")
+      }
       break
     case "group.error":
       if (ev.room === "" || ev.room === openRoom) roomError = ev.message
@@ -849,7 +858,7 @@ Panel {
     openRoom = ""
     roomRows = []
     roomWorking = false
-    roomPending = 0
+    roomActions = []
     armedDisband = ""
     sendCommand({ cmd: "groups" })
   }
@@ -877,6 +886,16 @@ Panel {
     if (openRoom === "" || body === "") return false
     sendCommand({ cmd: "group.send", room: openRoom, text: body })
     return true
+  }
+
+  // The card stays until the next poll shows the action resolved, so a failed answer is not hidden.
+  function answerRoomApproval(action, choice) {
+    sendCommand({ cmd: "group.approve", room: openRoom, member: action.member, taskId: action.taskId,
+      generation: action.generation, requestId: action.requestId, choice: choice })
+  }
+
+  function retryRoomTask(taskId) {
+    sendCommand({ cmd: "group.retry", room: openRoom, taskId: taskId })
   }
 
   function requestDisband() {
@@ -1288,9 +1307,15 @@ Panel {
     }
     function groupOpen(id: string): string { root.openGroup(id); return "opening" }
     function groupSend(text: string): string { return root.sendToRoom(text) ? "sent" : "no-room-or-empty" }
+    function roomAnswer(choice: string): string {
+      var a = root.roomActions.filter(function(x) { return x.kind === "approval" })[0]
+      if (!a) return "no-approval"
+      root.answerRoomApproval(a, choice)
+      return choice
+    }
     function groupDisband(id: string): string { root.sendCommand({ cmd: "group.disband", room: id }); return "disbanding" }
     function room(): string {
-      return JSON.stringify({ open: root.openRoom, working: root.roomWorking, pending: root.roomPending,
+      return JSON.stringify({ open: root.openRoom, working: root.roomWorking, actions: root.roomActions,
         error: root.roomError, count: root.roomRows.length, rows: root.roomRows.slice(-8) })
     }
     function dictateFile(path: string): string { root.sendCommand({ cmd: "dictate.file", profile: root.selected, path: path }); return "transcribing" }
@@ -1691,7 +1716,7 @@ Panel {
             }
 
             Button {
-              text: root.showingGroups && root.roomWorking ? "Groups …" : "Groups"
+              text: root.roomActions.length > 0 ? "Groups ?" : root.showingGroups && root.roomWorking ? "Groups …" : "Groups"
               bordered: true
               selected: root.showingGroups
               foreground: root.dim
@@ -2073,11 +2098,11 @@ Panel {
           Item {
             visible: root.openRoom !== ""
             width: parent.width
-            implicitHeight: roomActions.implicitHeight
+            implicitHeight: roomHeaderButtons.implicitHeight
 
             Text {
               anchors.left: parent.left
-              anchors.right: roomActions.left
+              anchors.right: roomHeaderButtons.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               elide: Text.ElideRight
@@ -2089,7 +2114,7 @@ Panel {
             }
 
             Row {
-              id: roomActions
+              id: roomHeaderButtons
               anchors.right: parent.right
               spacing: Style.spacing.sm
 
@@ -2179,14 +2204,73 @@ Panel {
           }
 
           Text {
-            visible: root.openRoom !== "" && (root.roomWorking || root.roomPending > 0)
-            width: parent.width
-            wrapMode: Text.Wrap
-            text: (root.roomWorking ? "… bots are replying" : "")
-              + (root.roomPending > 0 ? (root.roomWorking ? "  ·  " : "") + root.roomPending + " approval(s) waiting, answer them in Hermes Desktop" : "")
-            color: root.roomPending > 0 ? root.urgent : root.dim
+            visible: root.openRoom !== "" && root.roomWorking
+            text: "… bots are replying"
+            color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.openRoom !== "" ? root.roomActions : []
+            Rectangle {
+              id: actionCard
+              required property var modelData
+              readonly property var action: modelData
+              width: parent.width
+              implicitHeight: actionColumn.implicitHeight + Style.space(12)
+              radius: Style.cornerRadius
+              color: root.alpha(root.urgent, 0.10)
+              border.width: 1
+              border.color: root.alpha(root.urgent, 0.4)
+
+              Column {
+                id: actionColumn
+                x: Style.space(6)
+                y: Style.space(6)
+                width: parent.width - Style.space(12)
+                spacing: Style.space(4)
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.Wrap
+                  text: actionCard.action.kind === "approval"
+                    ? "@" + actionCard.action.member + " needs approval: " + (actionCard.action.description || actionCard.action.command)
+                    : "A turn ended without a clear result and waits for a retry."
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  visible: actionCard.action.kind === "approval" && actionCard.action.description !== "" && actionCard.action.command !== ""
+                  width: parent.width
+                  wrapMode: Text.Wrap
+                  text: actionCard.action.command || ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Row {
+                  spacing: Style.spacing.sm
+
+                  Repeater {
+                    model: actionCard.action.kind === "approval" ? actionCard.action.choices : ["retry"]
+                    Button {
+                      required property var modelData
+                      text: modelData === "once" ? "Approve once" : modelData === "deny" ? "Deny" : modelData === "retry" ? "Retry" : modelData
+                      bordered: true
+                      foreground: modelData === "deny" ? root.urgent : root.foreground
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: modelData === "retry" ? root.retryRoomTask(actionCard.action.taskId)
+                        : root.answerRoomApproval(actionCard.action, modelData)
+                    }
+                  }
+                }
+              }
+            }
           }
 
           TextField {

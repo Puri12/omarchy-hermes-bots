@@ -36,6 +36,8 @@ type Command =
   | { cmd: "group.close" }
   | { cmd: "group.send"; room: string; text: string }
   | { cmd: "group.stop" | "group.disband"; room: string }
+  | { cmd: "group.approve"; room: string; member: string; taskId: string; generation: number; requestId: string; choice: "once" | "deny" }
+  | { cmd: "group.retry"; room: string; taskId: string }
   | { cmd: "create"; name: string; description?: string }
   | { cmd: "delete"; name: string }
   | { cmd: "profile.get"; profile: string }
@@ -368,6 +370,18 @@ class DemoRecorder {
       this.push(`${this.chord("middle-click", true)} at (${x}, ${y})`);
     }
   }
+}
+
+// A room driver pending action the panel can resolve: a member's tool approval, or a turn that
+// ended indeterminately and only runs again after an explicit retry.
+function roomAction(a: Json): Json | null {
+  if (a.kind === "retry") return { kind: "retry", taskId: String(a.task_id ?? "") };
+  if (a.kind !== "approval") return null;
+  const ap = (a.approval as Json | undefined) ?? {};
+  return { kind: "approval", member: String(a.member_id ?? ""), taskId: String(a.task_id ?? ""),
+    generation: Number(a.execution_generation ?? 0), requestId: String(a.request_id ?? ap.request_id ?? ""),
+    command: String(ap.command ?? ""), description: String(ap.description ?? ""),
+    choices: (ap.choices as string[] | undefined) ?? ["once", "deny"] };
 }
 
 // One hosted-room log event as a panel row; turn bookkeeping (started/settled/activity) is dropped.
@@ -1493,12 +1507,12 @@ class Remote {
       const d = ((await this.rpc("groups.state", { room_id: room })).driver_status as Json | undefined) ?? {};
       if (room !== this.openRoom) return;
       const working = d.working === true;
-      const pending = ((d.pending_actions as Json[] | undefined) ?? []).length;
-      const status = `${working}/${pending}`;
+      const actions = ((d.pending_actions as Json[] | undefined) ?? []).map(roomAction).filter((a) => a !== null);
+      const status = JSON.stringify([working, actions]);
       // Idle polls stay quiet; every connected panel receives these broadcasts.
       if (rows.length === 0 && status === this.roomStatus) return;
       this.roomStatus = status;
-      emit({ ev: "group.log", room, rows, working, pending });
+      emit({ ev: "group.log", room, rows, working, actions });
     } catch (e) {
       emit({ ev: "group.error", room, message: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -1512,6 +1526,17 @@ class Remote {
     const id = `puri-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     // A fresh thread per message, like a new topic in Hermes Desktop.
     await this.rpc("groups.send", { room_id: room, event_id: id, payload: { text: body, thread_id: id } });
+    if (room === this.openRoom) await this.groupPoll();
+  }
+
+  async groupApprove(room: string, member: string, taskId: string, generation: number, requestId: string, choice: "once" | "deny") {
+    await this.rpc("groups.approve", { room_id: room, member_id: member, task_id: taskId,
+      execution_generation: generation, choice, request_id: requestId });
+    if (room === this.openRoom) await this.groupPoll();
+  }
+
+  async groupRetry(room: string, taskId: string) {
+    await this.rpc("groups.retry", { room_id: room, task_id: taskId });
     if (room === this.openRoom) await this.groupPoll();
   }
 
@@ -1562,6 +1587,9 @@ class Remote {
       case "group.close": return this.groupClose();
       case "group.send": return this.groupCommand(c.room, () => this.groupSend(c.room, c.text));
       case "group.stop": return this.groupCommand(c.room, () => this.groupStop(c.room));
+      case "group.approve":
+        return this.groupCommand(c.room, () => this.groupApprove(c.room, c.member, c.taskId, c.generation, c.requestId, c.choice));
+      case "group.retry": return this.groupCommand(c.room, () => this.groupRetry(c.room, c.taskId));
       case "group.disband": return this.groupCommand(c.room, () => this.groupDisband(c.room));
       case "create": return this.create(c.name, c.description);
       case "delete": return this.remove(c.name);
