@@ -47,6 +47,16 @@ Panel {
   property var notices: ({})
   // Delegated children per bot: {profile: {subagentId: {goal, tool, count, done}}}.
   property var subagentsByProfile: ({})
+  property bool recording: false
+  property bool speaking: false
+  property string lastSpeech: ""
+  function toggleDictation() {
+    sendCommand(recording ? { cmd: "dictate.stop", profile: selected } : { cmd: "dictate.start" })
+  }
+  function speakText(text) {
+    if (speaking) { sendCommand({ cmd: "speak.stop" }); speaking = false; return }
+    sendCommand({ cmd: "speak", profile: selected, text: displayText(text), play: true })
+  }
   function runningSubagents(profile) {
     var map = subagentsByProfile[profile] || {}
     var out = []
@@ -448,6 +458,23 @@ Panel {
       break
     case "notice_clear":
       dismissNotice(ev.key)
+      break
+    case "dictation":
+      recording = ev.recording === true
+      break
+    case "transcript":
+      if (ev.text === "") lastError = "no speech recognised"
+      else {
+        input.text = input.text === "" ? ev.text : input.text + " " + ev.text
+        input.cursorPosition = input.length
+      }
+      break
+    case "speech":
+      speaking = ev.playing === true
+      lastSpeech = ev.local
+      break
+    case "speech.done":
+      speaking = false
       break
     case "subagent":
       var parentBot = profileForSession(ev.session)
@@ -1061,6 +1088,11 @@ Panel {
     function unread(): string { return JSON.stringify(root.unreadProfiles) }
     function notices(): string { return JSON.stringify(root.noticeList) }
     function subagents(): string { return JSON.stringify(root.subagentsByProfile[root.selected] || {}) }
+    function dictate(): string { root.toggleDictation(); return root.recording ? "stopping" : "recording" }
+    // Test hooks: synthesise without playing, and transcribe an existing audio file.
+    function speakQuiet(text: string): string { root.sendCommand({ cmd: "speak", profile: root.selected, text: text, play: false }); return "synthesising" }
+    function lastSpeech(): string { return root.lastSpeech }
+    function dictateFile(path: string): string { root.sendCommand({ cmd: "dictate.file", profile: root.selected, path: path }); return "transcribing" }
     // Test hook: run a raw gateway frame (JSON) through the helper's event mapping.
     function injectFrame(json: string): string { root.sendCommand({ cmd: "inject", frame: JSON.parse(json) }); return "injected" }
     function quote(index: int): string {
@@ -2026,7 +2058,7 @@ Panel {
               property bool expanded: false
               width: isTool ? parent.width
                 : images.length > 0 || files.length > 0 || scaffold ? parent.width * 0.88
-                : Math.min(parent.width * 0.88, bubbleText.implicitWidth + Style.space(20))
+                : Math.min(parent.width * 0.88, bubbleText.implicitWidth + Style.space(modelData.role === "bot" ? 34 : 20))
               x: mine ? parent.width - width : 0
               implicitHeight: (bubbleText.visible ? bubbleText.implicitHeight : 0) + imageColumn.implicitHeight
                 + Style.space(12)
@@ -2047,13 +2079,32 @@ Panel {
               }
 
               Text {
+                visible: modelData.role === "bot" && root.displayText(modelData.text) !== ""
+                z: 2
+                anchors.top: parent.top
+                anchors.right: parent.right
+                anchors.topMargin: Style.space(6)
+                anchors.rightMargin: Style.space(6)
+                text: root.speaking ? "■" : "🔊"
+                opacity: 0.55
+                color: root.dim
+                font.pixelSize: Style.font.caption
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -4
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.speakText(modelData.text)
+                }
+              }
+
+              Text {
                 id: bubbleText
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.margins: Style.space(6)
                 anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
+                anchors.rightMargin: Style.space(modelData.role === "bot" ? 24 : 10)
                 visible: text !== ""
                 text: modelData.role === "bot" ? root.colorLinks(root.displayText(modelData.text))
                   : foldable && expanded ? String(modelData.full).trim()
@@ -2447,7 +2498,7 @@ Panel {
           ScrollView {
             width: parent.width - sendButton.width - modelButton.width - parent.spacing * 2
               - (root.busy ? steerButton.width + queueButton.width + parent.spacing * 2
-                : newButton.width + imageButton.width + parent.spacing * 2)
+                : newButton.width + imageButton.width + micButton.width + parent.spacing * 3)
             height: Math.min(Math.max(input.implicitHeight, sendButton.height), Style.space(130))
             clip: true
 
@@ -2497,6 +2548,19 @@ Panel {
                 }
               }
             }
+          }
+
+          Button {
+            id: micButton
+            visible: !root.busy
+            width: visible ? implicitWidth : 0
+            text: root.recording ? "■ Stop" : "Mic"
+            bordered: true
+            selected: root.recording
+            foreground: root.recording ? root.urgent : root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.toggleDictation()
           }
 
           Button {

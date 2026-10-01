@@ -22,6 +22,11 @@ type Command =
   | { cmd: "reconnect" }
   // Test hook: feed a raw gateway frame through onFrame (used to exercise notice handling without a backend trigger).
   | { cmd: "inject"; frame: Json }
+  | { cmd: "speak"; profile: string; text: string; play?: boolean }
+  | { cmd: "speak.stop" }
+  | { cmd: "dictate.start" }
+  | { cmd: "dictate.stop"; profile: string }
+  | { cmd: "dictate.file"; profile: string; path: string }
   | { cmd: "create"; name: string; description?: string }
   | { cmd: "delete"; name: string }
   | { cmd: "profile.get"; profile: string }
@@ -786,6 +791,71 @@ class Remote {
   private keyByProfile = new Map<string, string>();
 
   // Panel Reconnect: a fresh login and gateway WebSocket, whatever state the old ones were stuck in.
+  // Voice. Speech is synthesised on the server (POST /api/audio/speak) and played locally with pw-play;
+  // dictation records the laptop mic with pw-record and transcribes on the server (POST /api/audio/transcribe).
+  private player: ReturnType<typeof Bun.spawn> | null = null;
+  private recorder: ReturnType<typeof Bun.spawn> | null = null;
+  private recordPath = "";
+
+  async speak(profile: string, text: string, play: boolean) {
+    await this.requireProfile(profile);
+    const clean = text.replace(/^\s*MEDIA:\S+\s*$/gm, "").trim().slice(0, 4000);
+    if (!clean) throw new RemoteError("nothing to read aloud");
+    const r = await this.api(`/api/audio/speak?profile=${encodeURIComponent(profile)}`, {
+      method: "POST", body: JSON.stringify({ text: clean }) });
+    const mime = String(r.mime_type ?? "audio/mpeg");
+    const local = await saveCache("audio", decodeDataUrl(String(r.data_url ?? "")),
+      mime.includes("wav") ? ".wav" : mime.includes("ogg") ? ".ogg" : ".mp3");
+    emit({ ev: "speech", profile, local, playing: play });
+    if (!play) return;
+    this.player?.kill();
+    const player = Bun.spawn(["pw-play", local], { stdout: "ignore", stderr: "pipe" });
+    this.player = player;
+    const code = await player.exited;
+    if (this.player === player) this.player = null;
+    if (code !== 0 && !player.killed) throw new RemoteError(`could not play audio (pw-play exit ${code})`);
+    emit({ ev: "speech.done", profile });
+  }
+
+  stopSpeech() {
+    this.player?.kill();
+    this.player = null;
+  }
+
+  dictateStart() {
+    if (this.recorder) return;
+    mkdirSync(`${cacheDir}/audio`, { recursive: true, mode: 0o700 });
+    this.recordPath = `${cacheDir}/audio/dictation-${Date.now()}.wav`;
+    this.recorder = Bun.spawn(["pw-record", "--rate", "16000", "--channels", "1", this.recordPath],
+      { stdout: "ignore", stderr: "ignore" });
+    emit({ ev: "dictation", recording: true });
+  }
+
+  async dictateStop(profile: string) {
+    const recorder = this.recorder;
+    if (!recorder) return;
+    this.recorder = null;
+    recorder.kill("SIGINT");
+    await recorder.exited;
+    emit({ ev: "dictation", recording: false });
+    try {
+      await this.transcribe(profile, this.recordPath);
+    } finally {
+      await Bun.file(this.recordPath).delete().catch(() => {});
+    }
+  }
+
+  async transcribe(profile: string, path: string) {
+    await this.requireProfile(profile);
+    const file = Bun.file(path);
+    if (!(await file.exists()) || file.size === 0) throw new RemoteError("no audio was recorded");
+    const mime = path.endsWith(".mp3") ? "audio/mpeg" : path.endsWith(".ogg") ? "audio/ogg" : "audio/wav";
+    const dataUrl = `data:${mime};base64,${Buffer.from(await file.arrayBuffer()).toString("base64")}`;
+    const r = await this.api(`/api/audio/transcribe?profile=${encodeURIComponent(profile)}`, {
+      method: "POST", body: JSON.stringify({ data_url: dataUrl, mime_type: mime }) });
+    emit({ ev: "transcript", profile, text: String(r.transcript ?? "").trim() });
+  }
+
   async reconnect() {
     this.cookie = "";
     const ws = this.ws;
@@ -1152,6 +1222,11 @@ class Remote {
       case "refresh": return emit(await this.status());
       case "reconnect": return this.reconnect();
       case "inject": return this.onFrame(c.frame);
+      case "speak": return this.speak(c.profile, c.text, c.play !== false);
+      case "speak.stop": return this.stopSpeech();
+      case "dictate.start": return this.dictateStart();
+      case "dictate.stop": return this.dictateStop(c.profile);
+      case "dictate.file": return this.transcribe(c.profile, c.path);
       case "create": return this.create(c.name, c.description);
       case "delete": return this.remove(c.name);
       case "profile.get": return this.profileGet(c.profile);
