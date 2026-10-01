@@ -34,7 +34,8 @@ type Command =
   | { cmd: "group.create"; name: string; members: string[] }
   | { cmd: "group.open"; room: string }
   | { cmd: "group.close" }
-  | { cmd: "group.send"; room: string; text: string }
+  | { cmd: "group.send"; room: string; text: string; thread?: string }
+  | { cmd: "group.rename"; room: string; name: string }
   | { cmd: "group.stop" | "group.disband"; room: string }
   | { cmd: "group.approve"; room: string; member: string; taskId: string; generation: number; requestId: string; choice: "once" | "deny" }
   | { cmd: "group.retry"; room: string; taskId: string }
@@ -390,8 +391,10 @@ function roomRow(e: Json): Json | null {
   const a = (e.actor as Json | undefined) ?? {};
   const member = String(p.member_id ?? a.display_name ?? a.profile ?? a.id ?? "");
   switch (e.kind) {
-    case "message.user": return { seq: e.seq, role: "you", who: "you", text: String(p.text ?? "") };
-    case "message.member": return { seq: e.seq, role: "bot", who: String(a.display_name ?? a.profile ?? member), text: String(p.text ?? "") };
+    case "message.user": return { seq: e.seq, role: "you", who: "you", text: String(p.text ?? ""), thread: String(p.thread_id ?? "") };
+    case "message.member":
+      return { seq: e.seq, role: "bot", who: String(a.display_name ?? a.profile ?? member), text: String(p.text ?? ""),
+        thread: String(p.thread_id ?? "") };
     case "turn.failed": return { seq: e.seq, role: "status", who: member, text: `hit an error: ${String(p.error ?? p.reason_code ?? "").split("\n")[0]}` };
     case "turn.cancelled": return { seq: e.seq, role: "status", who: member, text: "was stopped" };
     case "member.unavailable": return { seq: e.seq, role: "status", who: member, text: "is unavailable" };
@@ -1520,12 +1523,21 @@ class Remote {
     }
   }
 
-  async groupSend(room: string, text: string) {
+  async groupSend(room: string, text: string, thread = "") {
     const body = String(text ?? "").trim();
     if (!body) return;
     const id = `puri-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    // A fresh thread per message, like a new topic in Hermes Desktop.
-    await this.rpc("groups.send", { room_id: room, event_id: id, payload: { text: body, thread_id: id } });
+    // A new message starts its own thread, like a new topic in Hermes Desktop; a reply reuses the thread.
+    await this.rpc("groups.send", { room_id: room, event_id: id, payload: { text: body, thread_id: thread || id } });
+    if (room === this.openRoom) await this.groupPoll();
+  }
+
+  async groupRename(room: string, name: string) {
+    const title = String(name ?? "").trim();
+    if (!title) throw new RemoteError("a group name is required");
+    await this.rpc("groups.rename", { room_id: room, name: title,
+      event_id: `puri-rename-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` });
+    await this.groups();
     if (room === this.openRoom) await this.groupPoll();
   }
 
@@ -1585,7 +1597,8 @@ class Remote {
       case "group.create": return this.groupCommand("", () => this.groupCreate(c.name, c.members));
       case "group.open": return this.groupCommand(c.room, () => this.groupOpen(c.room));
       case "group.close": return this.groupClose();
-      case "group.send": return this.groupCommand(c.room, () => this.groupSend(c.room, c.text));
+      case "group.send": return this.groupCommand(c.room, () => this.groupSend(c.room, c.text, c.thread));
+      case "group.rename": return this.groupCommand(c.room, () => this.groupRename(c.room, c.name));
       case "group.stop": return this.groupCommand(c.room, () => this.groupStop(c.room));
       case "group.approve":
         return this.groupCommand(c.room, () => this.groupApprove(c.room, c.member, c.taskId, c.generation, c.requestId, c.choice));

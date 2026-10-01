@@ -125,6 +125,9 @@ Panel {
   // Driver pending actions of the open room: member approvals and turns that need an explicit retry.
   property var roomActions: []
   property var roomSeenRequests: ({})
+  // The thread a room reply continues ({thread, who, text}), and whether the room name is being edited.
+  property var roomReply: null
+  property bool renamingRoom: false
   property string roomError: ""
   property var newGroupMembers: ({})
   property string armedDisband: ""
@@ -506,6 +509,8 @@ Panel {
       roomWorking = false
       roomActions = []
       roomError = ""
+      roomReply = null
+      renamingRoom = false
       break
     case "group.log":
       if (ev.room !== openRoom) break
@@ -859,6 +864,8 @@ Panel {
     roomRows = []
     roomWorking = false
     roomActions = []
+    roomReply = null
+    renamingRoom = false
     armedDisband = ""
     sendCommand({ cmd: "groups" })
   }
@@ -884,7 +891,25 @@ Panel {
   function sendToRoom(text) {
     var body = String(text || "").trim()
     if (openRoom === "" || body === "") return false
-    sendCommand({ cmd: "group.send", room: openRoom, text: body })
+    sendCommand({ cmd: "group.send", room: openRoom, text: body, thread: roomReply ? roomReply.thread : "" })
+    roomReply = null
+    return true
+  }
+
+  // Clicking a message continues its thread; a bot's message also addresses that bot.
+  function replyInRoom(row) {
+    if (!row || !row.thread) return false
+    roomReply = { thread: row.thread, who: row.role === "bot" ? row.who : "", text: String(row.text || "") }
+    if (roomReply.who !== "" && roomInput.text.indexOf("@" + roomReply.who) < 0) roomInput.text = "@" + roomReply.who + " " + roomInput.text
+    roomInput.forceActiveFocus()
+    return true
+  }
+
+  function renameRoom(name) {
+    var title = String(name || "").trim()
+    if (openRoom === "" || title === "") return false
+    sendCommand({ cmd: "group.rename", room: openRoom, name: title })
+    renamingRoom = false
     return true
   }
 
@@ -1307,6 +1332,11 @@ Panel {
     }
     function groupOpen(id: string): string { root.openGroup(id); return "opening" }
     function groupSend(text: string): string { return root.sendToRoom(text) ? "sent" : "no-room-or-empty" }
+    function roomReplyLast(): string {
+      var bots = root.roomRows.filter(function(r) { return r.role === "bot" })
+      return bots.length > 0 && root.replyInRoom(bots[bots.length - 1]) ? "replying" : "no-bot-message"
+    }
+    function roomRename(name: string): string { return root.renameRoom(name) ? "renaming" : "no-room-or-empty" }
     function roomAnswer(choice: string): string {
       var a = root.roomActions.filter(function(x) { return x.kind === "approval" })[0]
       if (!a) return "no-approval"
@@ -1316,7 +1346,8 @@ Panel {
     function groupDisband(id: string): string { root.sendCommand({ cmd: "group.disband", room: id }); return "disbanding" }
     function room(): string {
       return JSON.stringify({ open: root.openRoom, working: root.roomWorking, actions: root.roomActions,
-        error: root.roomError, count: root.roomRows.length, rows: root.roomRows.slice(-8) })
+        error: root.roomError, count: root.roomRows.length, rows: root.roomRows.slice(-8), reply: root.roomReply,
+        name: root.openRoomInfo ? root.openRoomInfo.name : "" })
     }
     function dictateFile(path: string): string { root.sendCommand({ cmd: "dictate.file", profile: root.selected, path: path }); return "transcribing" }
     // Test hook: run a raw gateway frame (JSON) through the helper's event mapping.
@@ -1539,6 +1570,7 @@ Panel {
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
         || importPathField.activeFocus || importNameField.activeFocus || groupNameField.activeFocus || roomInput.activeFocus
+        || roomRenameField.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -2129,6 +2161,16 @@ Panel {
               }
 
               Button {
+                text: "Rename"
+                bordered: true
+                selected: root.renamingRoom
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.renamingRoom = !root.renamingRoom
+              }
+
+              Button {
                 text: root.armedDisband === root.openRoom ? "Click again to delete group" : "Delete group"
                 bordered: true
                 foreground: root.armedDisband === root.openRoom ? root.urgent : root.dim
@@ -2148,6 +2190,17 @@ Panel {
             }
           }
 
+          TextField {
+            id: roomRenameField
+            visible: root.openRoom !== "" && root.renamingRoom
+            width: parent.width
+            placeholderText: "new group name (Enter to save, Esc to cancel)"
+            foreground: root.foreground
+            onVisibleChanged: if (visible) { text = root.openRoomInfo ? root.openRoomInfo.name : ""; forceActiveFocus() }
+            onAccepted: root.renameRoom(text)
+            Keys.onEscapePressed: root.renamingRoom = false
+          }
+
           Rectangle {
             visible: root.openRoom !== ""
             width: parent.width
@@ -2164,9 +2217,30 @@ Panel {
               model: root.roomRows
               onCountChanged: Qt.callLater(function() { roomView.positionViewAtEnd() })
 
-              delegate: Column {
+              // Click a message to reply in its thread; links inside the text still open.
+              delegate: Item {
                 required property var modelData
                 width: roomView.width
+                implicitHeight: rowColumn.implicitHeight
+
+                Rectangle {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(2)
+                  radius: Style.cornerRadius
+                  color: root.roomReply && modelData.thread && root.roomReply.thread === modelData.thread
+                    ? root.alpha(Color.accent, 0.12) : "transparent"
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  enabled: modelData.role !== "status" && !!modelData.thread
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.replyInRoom(modelData)
+                }
+
+                Column {
+                id: rowColumn
+                width: parent.width
                 spacing: Style.space(1)
 
                 Text {
@@ -2189,6 +2263,7 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: modelData.role === "status" ? Style.font.caption : Style.font.bodySmall
                   onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                }
                 }
               }
             }
@@ -2273,11 +2348,46 @@ Panel {
             }
           }
 
+          Item {
+            visible: root.openRoom !== "" && root.roomReply !== null
+            width: parent.width
+            implicitHeight: replyLine.implicitHeight
+
+            Text {
+              id: replyLine
+              anchors.left: parent.left
+              anchors.right: replyCancel.left
+              anchors.rightMargin: Style.space(8)
+              elide: Text.ElideRight
+              text: root.roomReply ? "↩ in thread" + (root.roomReply.who ? " with @" + root.roomReply.who : "") + ": "
+                + root.roomReply.text.replace(/\s+/g, " ") : ""
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              id: replyCancel
+              anchors.right: parent.right
+              anchors.verticalCenter: replyLine.verticalCenter
+              text: "×"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.roomReply = null
+              }
+            }
+          }
+
           TextField {
             id: roomInput
             visible: root.openRoom !== ""
             width: parent.width
-            placeholderText: "Message the group  (@bot to address one)"
+            placeholderText: root.roomReply ? "Reply in this thread" : "Message the group  (@bot to address one)"
             foreground: root.foreground
             onAccepted: if (root.sendToRoom(text)) text = ""
           }
