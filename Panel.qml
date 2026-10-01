@@ -127,6 +127,8 @@ Panel {
   property var roomSeenRequests: ({})
   // The thread a room reply continues ({thread, who, text}), and whether the room name is being edited.
   property var roomReply: null
+  // Rooms with member messages the user has not seen in the panel (room id -> true).
+  property var groupUnread: ({})
   property bool renamingRoom: false
   property string roomError: ""
   property var newGroupMembers: ({})
@@ -226,6 +228,14 @@ Panel {
     if (opened && profile === selected) return
     Quickshell.execDetached(["omarchy-notification-send", "--app-name", "Hermes Bots", "-g", "󰚩", "-u", urgency || "normal",
       title, String(body || "").slice(0, 240), "--exec", "omarchy-shell", "puri.hermes", "show", profile || selected])
+  }
+
+  // Clicking a room toast opens the panel on that room.
+  function notifyRoom(room, title, body, urgency) {
+    if (!primaryClient) return
+    if (opened && showingGroups && openRoom === room) return
+    Quickshell.execDetached(["omarchy-notification-send", "--app-name", "Hermes Bots", "-g", "󰚩", "-u", urgency || "normal",
+      title, String(body || "").slice(0, 240), "--exec", "omarchy-shell", "puri.hermes", "showGroup", room])
   }
 
   function setActivity(profile, text) {
@@ -503,7 +513,20 @@ Panel {
     case "groups":
       groupRooms = ev.rooms || []
       break
+    case "group.activity":
+      if (!(opened && showingGroups && openRoom === ev.room)) {
+        var unread = Object.assign({}, groupUnread)
+        unread[ev.room] = true
+        groupUnread = unread
+      }
+      notifyRoom(ev.room, "@" + ev.who + " in " + ev.name, ev.text, ev.mention ? "critical" : "normal")
+      break
     case "group.opened":
+      if (groupUnread[ev.room]) {
+        var seenRooms = Object.assign({}, groupUnread)
+        delete seenRooms[ev.room]
+        groupUnread = seenRooms
+      }
       openRoom = ev.room
       roomRows = []
       roomWorking = false
@@ -521,8 +544,8 @@ Panel {
         var act = roomActions[ai]
         if (act.kind !== "approval" || roomSeenRequests[act.requestId]) continue
         roomSeenRequests[act.requestId] = true
-        notify("@" + act.member + " needs approval in " + (openRoomInfo ? openRoomInfo.name : "a group"),
-          act.description || act.command, "", "critical")
+        notifyRoom(openRoom, "@" + act.member + " needs approval in " + (openRoomInfo ? openRoomInfo.name : "a group"),
+          act.description || act.command, "critical")
       }
       break
     case "group.error":
@@ -1332,6 +1355,12 @@ Panel {
     }
     function groupOpen(id: string): string { root.openGroup(id); return "opening" }
     function groupSend(text: string): string { return root.sendToRoom(text) ? "sent" : "no-room-or-empty" }
+    function groupUnread(): string { return JSON.stringify(Object.keys(root.groupUnread)) }
+    function showGroup(room: string): void {
+      root.open()
+      if (!root.showingGroups) root.toggleGroups()
+      root.openGroup(room)
+    }
     function roomReplyLast(): string {
       var bots = root.roomRows.filter(function(r) { return r.role === "bot" })
       return bots.length > 0 && root.replyInRoom(bots[bots.length - 1]) ? "replying" : "no-bot-message"
@@ -1748,7 +1777,8 @@ Panel {
             }
 
             Button {
-              text: root.roomActions.length > 0 ? "Groups ?" : root.showingGroups && root.roomWorking ? "Groups …" : "Groups"
+              text: root.roomActions.length > 0 ? "Groups ?" : Object.keys(root.groupUnread).length > 0 ? "Groups •"
+                : root.showingGroups && root.roomWorking ? "Groups …" : "Groups"
               bordered: true
               selected: root.showingGroups
               foreground: root.dim
@@ -2062,7 +2092,8 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 width: parent.width - Style.space(16)
                 elide: Text.ElideRight
-                text: "👥 " + modelData.name + "  ·  " + modelData.members.map(function(m) { return "@" + m }).join(" ")
+                text: (root.groupUnread[modelData.id] ? "• " : "") + "👥 " + modelData.name + "  ·  "
+                  + modelData.members.map(function(m) { return "@" + m }).join(" ")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

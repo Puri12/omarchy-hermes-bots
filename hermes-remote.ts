@@ -85,6 +85,7 @@ const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`/g;
 // Anything else in a MEDIA: tag (pdf, csv, zip, ...) is fetched as a plain file download.
 const IMAGE_PATH_RE = /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i;
 const CRON_POLL_MS = 30000;
+const ROOM_WATCH_MS = 20000;
 const NOVNC_DIR = `${import.meta.dir}/novnc`;
 const SOCKET_PATH = process.env.XDG_RUNTIME_DIR
   ? `${process.env.XDG_RUNTIME_DIR}/puri-hermes.sock` : `/tmp/puri-hermes-${process.getuid?.() ?? 0}.sock`;
@@ -1541,6 +1542,30 @@ class Remote {
     if (room === this.openRoom) await this.groupPoll();
   }
 
+  // Rooms the panel is not showing are checked for new member messages, so a reply or an @user
+  // call in a background room still reaches the user. The first sight of a room only records it.
+  private roomSeen = new Map<string, number>();
+
+  async watchRooms() {
+    const r = await this.rpc("groups.list", { limit: 50 });
+    for (const x of (r.rooms as Json[]) ?? []) {
+      const room = String(x.room_id);
+      const latest = Number(x.latest_seq ?? 0);
+      const seen = this.roomSeen.get(room);
+      this.roomSeen.set(room, latest);
+      if (seen === undefined || latest <= seen || room === this.openRoom) continue;
+      const log = await this.rpc("groups.log", { room_id: room, since_seq: seen, limit: 100 });
+      for (const e of (log.events as Json[]) ?? []) {
+        if (e.kind !== "message.member") continue;
+        const row = roomRow(e);
+        const text = String(row?.text ?? "").trim();
+        if (!row || !text) continue;
+        emit({ ev: "group.activity", room, name: String(x.name ?? room), who: String(row.who), text: text.slice(0, 300),
+          mention: /(^|\s)@(user|everyone|all)\b/i.test(text) });
+      }
+    }
+  }
+
   async groupApprove(room: string, member: string, taskId: string, generation: number, requestId: string, choice: "once" | "deny") {
     await this.rpc("groups.approve", { room_id: room, member_id: member, task_id: taskId,
       execution_generation: generation, choice, request_id: requestId });
@@ -1764,7 +1789,7 @@ async function daemon(remote: Remote) {
   const backlog: Json[] = [];
   emit = (ev: Json) => {
     if (clients.size === 0) {
-      if (ev.ev === "cron") backlog.push(ev);
+      if (ev.ev === "cron" || ev.ev === "group.activity") backlog.push(ev);
       return;
     }
     for (const c of clients) send(c, ev);
@@ -1832,6 +1857,10 @@ async function daemon(remote: Remote) {
     .catch((e) => process.stderr.write(`cron poll failed: ${e instanceof Error ? e.message : String(e)}\n`))
     .finally(() => setTimeout(pollCron, CRON_POLL_MS));
   void pollCron();
+  const watchRooms = () => remote.watchRooms()
+    .catch((e) => process.stderr.write(`room watch failed: ${e instanceof Error ? e.message : String(e)}\n`))
+    .finally(() => setTimeout(watchRooms, ROOM_WATCH_MS));
+  void watchRooms();
 }
 
 async function main() {
