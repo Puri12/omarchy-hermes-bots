@@ -20,6 +20,8 @@ type Json = Record<string, unknown>;
 type Command =
   | { cmd: "refresh" }
   | { cmd: "reconnect" }
+  // Test hook: feed a raw gateway frame through onFrame (used to exercise notice handling without a backend trigger).
+  | { cmd: "inject"; frame: Json }
   | { cmd: "create"; name: string; description?: string }
   | { cmd: "delete"; name: string }
   | { cmd: "profile.get"; profile: string }
@@ -382,8 +384,22 @@ class Remote {
       case "tool.generating":
         emit({ ev: "activity", session: sid, text: `preparing ${String(payload.name ?? "tool")}` });
         break;
-      case "status.update":
-        if (String(payload.text ?? "").trim()) emit({ ev: "activity", session: sid, text: String(payload.text).trim() });
+      case "status.update": {
+        const text = String(payload.text ?? "").trim();
+        if (text) emit({ ev: "activity", session: sid, text });
+        // Rate-limit warnings and model fallbacks are worth a banner, not just a status line.
+        const kind = String(payload.kind ?? "");
+        if (text && (kind === "warn" || kind === "fallback"))
+          emit({ ev: "notice", key: `status.${kind}`, level: "warn", kind: "ttl", ttl_ms: 15000, text });
+        break;
+      }
+      case "notification.show":
+        if (String(payload.text ?? "").trim())
+          emit({ ev: "notice", key: String(payload.key || payload.id || payload.text), level: String(payload.level ?? "info"),
+            kind: String(payload.kind ?? "sticky"), ttl_ms: Number(payload.ttl_ms ?? 0), text: String(payload.text).trim() });
+        break;
+      case "notification.clear":
+        emit({ ev: "notice_clear", key: String(payload.key ?? "") });
         break;
       case "session.usage": {
         const u = (payload.usage as Json) ?? {};
@@ -1122,6 +1138,7 @@ class Remote {
     switch (c.cmd) {
       case "refresh": return emit(await this.status());
       case "reconnect": return this.reconnect();
+      case "inject": return this.onFrame(c.frame);
       case "create": return this.create(c.name, c.description);
       case "delete": return this.remove(c.name);
       case "profile.get": return this.profileGet(c.profile);

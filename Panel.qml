@@ -43,6 +43,19 @@ Panel {
   property var activityByProfile: ({})
   property var todosByProfile: ({})
   property var unreadProfiles: ({})
+  // Server notices (credits, slow start, rate limit / fallback) keyed like Hermes Desktop toasts.
+  property var notices: ({})
+  readonly property var noticeList: {
+    revision
+    var list = []
+    for (var k in notices) list.push(notices[k])
+    return list.sort(function(a, b) { return b.at - a.at }).slice(0, 3)
+  }
+  function dismissNotice(key) {
+    if (notices[key] === undefined) return
+    delete notices[key]
+    revision++
+  }
   property var lastSentByProfile: ({})
   function toggleSearch() {
     searching = !searching
@@ -414,6 +427,14 @@ Panel {
     case "usage":
       usageByProfile[profileForSession(ev.session)] = { total: ev.total, contextPercent: ev.contextPercent }
       revision++
+      break
+    case "notice":
+      notices[ev.key] = { key: ev.key, text: String(ev.text).replace(/^[•⚠✕✗✓]\s*/, ""), level: ev.level,
+        expires: ev.kind === "ttl" && ev.ttl_ms > 0 ? Date.now() + ev.ttl_ms : 0, at: Date.now() }
+      revision++
+      break
+    case "notice_clear":
+      dismissNotice(ev.key)
       break
     case "todos":
       todosByProfile[profileForSession(ev.session)] = ev.todos || []
@@ -1008,6 +1029,9 @@ Panel {
     }
     // Returns the cached list for the selected bot and asks the helper for a fresh one.
     function unread(): string { return JSON.stringify(root.unreadProfiles) }
+    function notices(): string { return JSON.stringify(root.noticeList) }
+    // Test hook: run a raw gateway frame (JSON) through the helper's event mapping.
+    function injectFrame(json: string): string { root.sendCommand({ cmd: "inject", frame: JSON.parse(json) }); return "injected" }
     function quote(index: int): string {
       root.quoteRow(root.shownMessages[index])
       return root.quoteText
@@ -1101,6 +1125,16 @@ Panel {
   Timer { id: disarmTimer; interval: 5000; onTriggered: { root.armedDelete = ""; root.armedSessionDelete = "" } }
   Timer { id: routineDisarmTimer; interval: 5000; onTriggered: root.armedRoutine = "" }
   Timer { id: restartTimer; interval: 5000; onTriggered: bridge.running = true }
+  // Drops ttl notices once they expire.
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.noticeList.some(function(n) { return n.expires > 0 })
+    onTriggered: {
+      var now = Date.now()
+      for (var k in root.notices) if (root.notices[k].expires > 0 && root.notices[k].expires <= now) root.dismissNotice(k)
+    }
+  }
 
   // The shared daemon drops its login and WebSocket and logs in again; then this panel's client is
   // restarted. Transcripts stay; 'ready' reloads the selected bot and refreshes status.
@@ -1868,6 +1902,48 @@ Panel {
           wrapMode: Text.WordWrap
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          model: root.noticeList
+          Rectangle {
+            required property var modelData
+            width: parent.width
+            height: noticeText.implicitHeight + Style.space(10)
+            radius: Style.cornerRadius
+            // root.alpha() needs a color value, not a "#hex" string, so the warn/success tints are built here.
+            readonly property color tone: modelData.level === "error" ? root.urgent
+              : modelData.level === "warn" ? Qt.rgba(0.88, 0.63, 0.31, 1)
+              : modelData.level === "success" ? Qt.rgba(0.5, 0.75, 0.5, 1) : Color.accent
+            color: root.alpha(tone, 0.2)
+            border.width: 1
+            border.color: root.alpha(tone, 0.6)
+            Text {
+              id: noticeText
+              anchors.left: parent.left
+              anchors.right: noticeClose.left
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(8)
+              text: modelData.text
+              wrapMode: Text.Wrap
+              maximumLineCount: 2
+              elide: Text.ElideRight
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              id: noticeClose
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "×"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              MouseArea { anchors.fill: parent; anchors.margins: -6; onClicked: root.dismissNotice(modelData.key) }
+            }
+          }
         }
 
         PanelSeparator { foreground: root.foreground }
