@@ -401,6 +401,19 @@ class Remote {
       case "notification.clear":
         emit({ ev: "notice_clear", key: String(payload.key ?? "") });
         break;
+      // delegate_task children report on the parent's sid; the child's own text stream is not forwarded.
+      case "subagent.start":
+      case "subagent.tool":
+      case "subagent.progress":
+      case "subagent.complete": {
+        const phase = p.type === "subagent.start" ? "start" : p.type === "subagent.complete" ? "done" : "tool";
+        emit({ ev: "subagent", session: sid, phase, id: String(payload.subagent_id ?? payload.delegation_id ?? ""),
+          goal: String(payload.goal ?? "").slice(0, 160),
+          tool: String(payload.tool_preview ?? payload.tool_name ?? payload.text ?? "").replace(/\s+/g, " ").slice(0, 80),
+          count: Number(payload.tool_count ?? 0), status: String(payload.status ?? ""),
+          summary: String(payload.summary ?? "").trim().slice(0, 400), secs: Number(payload.duration_seconds ?? 0) });
+        break;
+      }
       case "session.usage": {
         const u = (payload.usage as Json) ?? {};
         emit({ ev: "usage", session: sid, total: Number(u.total ?? 0), contextPercent: Number(u.context_percent ?? 0) });

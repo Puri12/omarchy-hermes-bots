@@ -45,6 +45,14 @@ Panel {
   property var unreadProfiles: ({})
   // Server notices (credits, slow start, rate limit / fallback) keyed like Hermes Desktop toasts.
   property var notices: ({})
+  // Delegated children per bot: {profile: {subagentId: {goal, tool, count, done}}}.
+  property var subagentsByProfile: ({})
+  function runningSubagents(profile) {
+    var map = subagentsByProfile[profile] || {}
+    var out = []
+    for (var id in map) if (!map[id].done) out.push(map[id])
+    return out
+  }
   readonly property var noticeList: {
     revision
     var list = []
@@ -153,8 +161,12 @@ Panel {
       var secs = Math.max(0, Math.round((nowMs - (a ? a.since : nowMs)) / 1000))
       var label = !a ? "working…" : a.text === "thinking" ? "thinking…" : a.text === "writing" ? "writing…"
         : a.text.indexOf("❓") === 0 ? a.text : "⚙ " + a.text
-      return label + " · " + secs + "s"
+      var subs = runningSubagents(selected)
+      return label + " · " + secs + "s" + (subs.length > 0 ? "  ·  🔀 " + subs.length + " delegated" + (subs[0].tool ? ": " + subs[0].tool : "") : "")
     }
+    // delegate_task runs in the background, so children can outlive the parent's turn.
+    var running = runningSubagents(selected)
+    if (running.length > 0) return "🔀 " + running.length + " delegated task" + (running.length > 1 ? "s" : "") + " running" + (running[0].tool ? ": " + running[0].tool : "")
     return cron ? "⏱ scheduled job running: " + cron : ""
   }
   readonly property bool waitingOnUser: clarify !== null || approval !== null
@@ -382,12 +394,13 @@ Panel {
       }
       break
     case "start":
-      // A turn the panel did not start (a queued message draining after the previous turn).
+      // A turn the panel did not start: a queued message draining, or a background result
+      // (delegated task, process) that Hermes hands back to the bot as a new turn.
       var starter = profileForSession(ev.session)
       if (!busyProfiles[starter]) {
         setBusy(starter, true)
         setActivity(starter, "thinking")
-        pushMessage(starter, "tool", "⏳ running queued message")
+        pushMessage(starter, "tool", "⏳ bot continues (queued message or background result)")
       }
       break
     case "history":
@@ -435,6 +448,22 @@ Panel {
       break
     case "notice_clear":
       dismissNotice(ev.key)
+      break
+    case "subagent":
+      var parentBot = profileForSession(ev.session)
+      var subs = subagentsByProfile[parentBot] || {}
+      var sub = subs[ev.id] || { id: ev.id, goal: ev.goal, tool: "", count: 0, done: false }
+      if (ev.goal) sub.goal = ev.goal
+      if (ev.phase === "tool" && ev.tool) { sub.tool = ev.tool; sub.count = ev.count }
+      if (ev.phase === "start") pushMessage(parentBot, "tool", "🔀 delegated: " + sub.goal)
+      if (ev.phase === "done") {
+        sub.done = true
+        pushMessage(parentBot, "tool", "🔀 " + (ev.status || "done") + (ev.secs ? " in " + Math.round(ev.secs) + "s" : "") + " · " + sub.goal
+          + (ev.summary ? " — " + ev.summary.split("\n")[0] : ""))
+      }
+      subs[ev.id] = sub
+      subagentsByProfile[parentBot] = subs
+      revision++
       break
     case "todos":
       todosByProfile[profileForSession(ev.session)] = ev.todos || []
@@ -490,6 +519,7 @@ Panel {
       break
     case "cleared":
       delete todosByProfile[ev.profile]
+      delete subagentsByProfile[ev.profile]
       var queued = queuedSendByProfile[ev.profile]
       transcripts[ev.profile] = []
       pendingByProfile[ev.profile] = []
@@ -1030,6 +1060,7 @@ Panel {
     // Returns the cached list for the selected bot and asks the helper for a fresh one.
     function unread(): string { return JSON.stringify(root.unreadProfiles) }
     function notices(): string { return JSON.stringify(root.noticeList) }
+    function subagents(): string { return JSON.stringify(root.subagentsByProfile[root.selected] || {}) }
     // Test hook: run a raw gateway frame (JSON) through the helper's event mapping.
     function injectFrame(json: string): string { root.sendCommand({ cmd: "inject", frame: JSON.parse(json) }); return "injected" }
     function quote(index: int): string {
