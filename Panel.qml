@@ -50,6 +50,7 @@ Panel {
   property bool recording: false
   property bool speaking: false
   property string lastSpeech: ""
+  property string lastTemplate: ""
   function toggleDictation() {
     sendCommand(recording ? { cmd: "dictate.stop", profile: selected } : { cmd: "dictate.start" })
   }
@@ -458,6 +459,14 @@ Panel {
       break
     case "notice_clear":
       dismissNotice(ev.key)
+      break
+    case "template.exported":
+      lastTemplate = ev.path
+      pushMessage(ev.profile, "tool", "📦 template saved: " + ev.path + " (" + ev.skills + " skills, " + ev.routines + " routines)")
+      break
+    case "template.imported":
+      pushMessage(ev.profile, "tool", "📦 created from template (" + ev.skills + " skills, " + ev.routines + " routines)")
+      selected = ev.profile
       break
     case "dictation":
       recording = ev.recording === true
@@ -1092,6 +1101,9 @@ Panel {
     // Test hooks: synthesise without playing, and transcribe an existing audio file.
     function speakQuiet(text: string): string { root.sendCommand({ cmd: "speak", profile: root.selected, text: text, play: false }); return "synthesising" }
     function lastSpeech(): string { return root.lastSpeech }
+    function templateExport(): string { root.sendCommand({ cmd: "template.export", profile: root.selected }); return "exporting" }
+    function lastTemplate(): string { return root.lastTemplate }
+    function templateImport(path: string, name: string): string { root.sendCommand({ cmd: "template.import", path: path, name: name }); return "importing" }
     function dictateFile(path: string): string { root.sendCommand({ cmd: "dictate.file", profile: root.selected, path: path }); return "transcribing" }
     // Test hook: run a raw gateway frame (JSON) through the helper's event mapping.
     function injectFrame(json: string): string { root.sendCommand({ cmd: "inject", frame: JSON.parse(json) }); return "injected" }
@@ -1272,6 +1284,7 @@ Panel {
         || clarifyField.activeFocus || modelField.activeFocus || attachField.activeFocus
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
+        || importPathField.activeFocus || importNameField.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -1896,6 +1909,35 @@ Panel {
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               onClicked: root.duplicateProfile(duplicateField.text)
+            }
+            Button {
+              text: "Export"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.sendCommand({ cmd: "template.export", profile: root.selected })
+            }
+            TextField {
+              id: importPathField
+              width: Style.space(150)
+              placeholderText: "template .json path"
+              foreground: root.foreground
+            }
+            TextField {
+              id: importNameField
+              width: Style.space(100)
+              placeholderText: "new bot name"
+              foreground: root.foreground
+              onAccepted: root.sendCommand({ cmd: "template.import", path: importPathField.text, name: text })
+            }
+            Button {
+              text: "Import"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.sendCommand({ cmd: "template.import", path: importPathField.text, name: importNameField.text })
             }
           }
         }

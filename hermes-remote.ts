@@ -24,6 +24,8 @@ type Command =
   | { cmd: "inject"; frame: Json }
   | { cmd: "speak"; profile: string; text: string; play?: boolean }
   | { cmd: "speak.stop" }
+  | { cmd: "template.export"; profile: string }
+  | { cmd: "template.import"; path: string; name: string }
   | { cmd: "dictate.start" }
   | { cmd: "dictate.stop"; profile: string }
   | { cmd: "dictate.file"; profile: string; path: string }
@@ -791,6 +793,53 @@ class Remote {
   private keyByProfile = new Map<string, string>();
 
   // Panel Reconnect: a fresh login and gateway WebSocket, whatever state the old ones were stuck in.
+  // Bot templates: role (description + SOUL), model, the bot's own (non-bundled) skills and its routines,
+  // as one JSON file. Conversations, memory and credentials are never included.
+  async templateExport(profile: string) {
+    await this.requireProfile(profile);
+    const scope = `profile=${encodeURIComponent(profile)}`;
+    const roster = ((await this.api("/api/profiles")).profiles as Json[]) ?? [];
+    const row = roster.find((p) => p.name === profile) ?? {};
+    const soul = profile === "default" ? {} : await this.api(`/api/profiles/${encodeURIComponent(profile)}/soul`).catch(() => ({}));
+    const skillRows = ((await this.api(`/api/skills?${scope}`)) as unknown as Json[]) ?? [];
+    const skills: Json[] = [];
+    for (const s of skillRows.filter((x) => x.provenance !== "bundled")) {
+      const c = await this.api(`/api/skills/content?name=${encodeURIComponent(String(s.name))}&${scope}`);
+      skills.push({ name: s.name, category: s.category ?? "", content: c.content ?? "" });
+    }
+    const jobs = ((await this.api(`/api/cron/jobs?${scope}`)) as unknown as Json[]) ?? [];
+    const routines = jobs.map((j) => {
+      const sched = (j.schedule as Json | undefined) ?? {};
+      return { name: j.name, schedule: sched.kind === "cron" ? sched.expr : (j.schedule_display ?? sched.display), prompt: j.prompt };
+    });
+    const template = { format: "puri.hermes/bot-template", version: 1, exportedFrom: profile, exportedAt: new Date().toISOString(),
+      description: String(row.description ?? ""), soul: String((soul as Json).content ?? ""), provider: String(row.provider ?? ""),
+      model: String(row.model ?? ""), skills, routines };
+    const dir = existsSync(`${process.env.HOME}/Downloads`) ? `${process.env.HOME}/Downloads` : `${cacheDir}/templates`;
+    mkdirSync(dir, { recursive: true });
+    const path = `${dir}/hermes-bot-${profile}.json`;
+    await Bun.write(path, JSON.stringify(template, null, 2));
+    emit({ ev: "template.exported", profile, path, skills: skills.length, routines: routines.length });
+  }
+
+  async templateImport(rawPath: string, name: string) {
+    const path = rawPath.trim().replace(/^~(?=\/)/, process.env.HOME ?? "~").replace(/^file:\/\//, "");
+    const file = Bun.file(path);
+    if (!(await file.exists())) throw new RemoteError(`template not found: ${rawPath}`);
+    const t = (await file.json().catch(() => null)) as Json | null;
+    if (!t || t.format !== "puri.hermes/bot-template") throw new RemoteError("not a puri.hermes bot template");
+    const bot = name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+    if (!bot) throw new RemoteError("template import needs a bot name");
+    await this.status();
+    if (this.knownProfiles.has(bot)) throw new RemoteError(`@${bot} already exists`);
+    await this.create(bot, String(t.description ?? ""));
+    await this.profileSave(bot, String(t.description ?? ""), String(t.soul ?? ""));
+    if (t.model) await this.setModel(bot, String(t.provider || "custom"), String(t.model));
+    for (const s of (t.skills as Json[]) ?? []) await this.skillSave(bot, String(s.name), String(s.content), String(s.category || "") || undefined);
+    for (const r of (t.routines as Json[]) ?? []) await this.routineCreate(bot, String(r.name), String(r.schedule), String(r.prompt ?? ""));
+    emit({ ev: "template.imported", profile: bot, skills: ((t.skills as Json[]) ?? []).length, routines: ((t.routines as Json[]) ?? []).length });
+  }
+
   // Voice. Speech is synthesised on the server (POST /api/audio/speak) and played locally with pw-play;
   // dictation records the laptop mic with pw-record and transcribes on the server (POST /api/audio/transcribe).
   private player: ReturnType<typeof Bun.spawn> | null = null;
@@ -1224,6 +1273,8 @@ class Remote {
       case "inject": return this.onFrame(c.frame);
       case "speak": return this.speak(c.profile, c.text, c.play !== false);
       case "speak.stop": return this.stopSpeech();
+      case "template.export": return this.templateExport(c.profile);
+      case "template.import": return this.templateImport(c.path, c.name);
       case "dictate.start": return this.dictateStart();
       case "dictate.stop": return this.dictateStop(c.profile);
       case "dictate.file": return this.transcribe(c.profile, c.path);
