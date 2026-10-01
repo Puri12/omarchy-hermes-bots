@@ -1,0 +1,3 @@
+name: outbound-review
+version: "1.0"
+description: Hold every send_message for review as a draft card in the puri.hermes panel

@@ -1346,6 +1346,13 @@ Panel {
     function editView(): string { if (!root.editing) root.toggleEdit(); return "shown" }
     function screenTake(): string { root.screenLease("take"); return "taking" }
     // Test hooks: record without opening the screen page, and inspect or save the resulting draft.
+    function draftState(): string { return JSON.stringify(root.approvalDraft) }
+    function draftAction(action: string): string {
+      if (!root.approvalDraft) return "no-draft"
+      if (action === "edit") root.editDraft()
+      else root.answerApproval(action === "send" ? "once" : "deny")
+      return action
+    }
     function demoStart(): string { root.sendCommand({ cmd: "demo.start", profile: root.selected }); return "starting" }
     function demoStop(): string { root.stopDemo(); return "stopping" }
     function demoState(): string {
@@ -1363,10 +1370,30 @@ Panel {
     }
   }
 
+  // An approval raised by the outbound-review Hermes plugin (hermes-plugin/) is a message draft:
+  // "To: <target>", a blank line, then the text.
+  readonly property var approvalDraft: {
+    if (!approval || String(approval.command).indexOf("<send_message>") !== 0) return null
+    var d = String(approval.description || "")
+    var m = d.match(/^To: (.*)\n\n([\s\S]*)$/)
+    return m ? { target: m[1], body: m[2] } : { target: "", body: d }
+  }
+
+  // Editing is a discard plus a corrected instruction in the composer; the bot's next send is a new draft.
+  function editDraft() {
+    var d = approvalDraft
+    if (!d) return
+    answerApproval("deny")
+    input.text = "Don't send that. Send this to " + (d.target || "the same recipient") + " instead:\n\n" + d.body
+    input.cursorPosition = input.text.length
+    input.forceActiveFocus()
+  }
+
   function answerApproval(choice) {
     if (!approval) return
     sendCommand({ cmd: "approve", requestId: approval.requestId, choice: choice })
-    pushMessage(profileForSession(approval.session), "tool", "✔ approval: " + choice)
+    pushMessage(profileForSession(approval.session), "tool", approvalDraft
+      ? (choice === "deny" ? "✉ draft discarded" : "✉ draft approved, sending") : "✔ approval: " + choice)
     if (busyProfiles[profileForSession(approval.session)]) setActivity(profileForSession(approval.session), "thinking")
     approval = null
   }
@@ -2848,17 +2875,66 @@ Panel {
 
             Text {
               width: parent.width
-              text: root.approval ? ("Approval needed: " + (root.approval.description || root.approval.command)) : ""
+              text: root.approvalDraft ? "✉ Draft to " + (root.approvalDraft.target || "the default target")
+                  + ". Nothing is sent until you press Send."
+                : root.approval ? ("Approval needed: " + (root.approval.description || root.approval.command)) : ""
               color: root.foreground
               wrapMode: Text.Wrap
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+              font.bold: root.approvalDraft !== null
+            }
+
+            Text {
+              visible: root.approvalDraft !== null
+              width: parent.width
+              text: root.approvalDraft ? root.approvalDraft.body : ""
+              textFormat: Text.PlainText
+              color: root.foreground
+              wrapMode: Text.Wrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            // Drafts only offer a one-off send: "session"/"always" would skip review for later messages.
+            Row {
+              visible: root.approvalDraft !== null
+              spacing: Style.spacing.sm
+
+              Button {
+                visible: root.approval !== null && root.approval.choices.indexOf("once") >= 0
+                text: "Send"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.answerApproval("once")
+              }
+
+              Button {
+                text: "Edit…"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.editDraft()
+              }
+
+              Button {
+                text: "Discard"
+                bordered: true
+                foreground: root.urgent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.answerApproval("deny")
+              }
             }
 
             Row {
+              visible: root.approvalDraft === null
               spacing: Style.spacing.sm
               Repeater {
-                model: root.approval ? root.approval.choices : []
+                model: root.approval && root.approvalDraft === null ? root.approval.choices : []
                 Button {
                   required property var modelData
                   text: modelData
