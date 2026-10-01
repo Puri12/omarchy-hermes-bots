@@ -17,6 +17,7 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 - 위임 진행 표시: 봇이 하위 작업(delegate_task)을 맡기면 대화에 `🔀 delegated / completed` 줄, 상태줄에 진행 중인 위임 수와 마지막 도구를 표시(부모 답이 끝난 뒤에도 유지, IPC `subagents`)
 - 음성: 봇 말풍선의 🔊 로 서버 TTS(`/api/audio/speak`) 음성을 `pw-play`로 재생(다시 누르면 중지). 입력줄 **Mic**로 노트북 마이크를 `pw-record`로 녹음해 서버 STT(`/api/audio/transcribe`)로 받아쓴 글을 입력창에 넣음 — 서버에 STT 엔진(예: faster-whisper)이 있어야 하며, 없으면 서버 오류를 그대로 표시
 - 봇 템플릿: Edit 섹션의 **Export**로 역할(설명·SOUL)·모델·직접 만든 스킬·루틴을 `~/Downloads/hermes-bot-<봇>.json`에 저장, **Import**(파일 경로 + 새 봇 이름)로 그대로 새 봇 생성. 대화·기억·자격 증명은 포함하지 않음
+- 그룹 채팅: **Groups**에서 봇 2~6개를 골라 이름을 넣고 **Create group**. 방을 열면 모두에게, 또는 `@봇`으로 한 봇에게 말을 걸 수 있고 봇들이 Hermes Desktop 그룹 채팅과 같은 서버 방(hosted room)에서 차례로 답함. 패널이 열려 있고 방을 보고 있는 동안만 방 기록을 2.5초마다 받아 옴. 답하는 중이면 **Stop**, **Delete group**(두 번 클릭)으로 방 삭제. 방 안의 명령 승인 요청은 개수만 표시하고 답은 Hermes Desktop에서 함 (IPC `groupsView groups groupCreate <name> <bot,bot> groupOpen <id> groupSend <text> groupDisband <id> room`)
 - 스트리밍 답변, 작업 상태줄(thinking/writing/도구·경과 시간), 봇의 할 일 목록, 토큰·컨텍스트 사용량
 - 작업 중 추가 지시(Steer/Queue), 중지
 - 질문(clarify)·승인 카드, 긴급 알림, 루틴(cron) 완료 알림

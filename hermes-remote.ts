@@ -29,6 +29,12 @@ type Command =
   | { cmd: "dictate.start" }
   | { cmd: "dictate.stop"; profile: string }
   | { cmd: "dictate.file"; profile: string; path: string }
+  | { cmd: "groups" }
+  | { cmd: "group.create"; name: string; members: string[] }
+  | { cmd: "group.open"; room: string }
+  | { cmd: "group.close" }
+  | { cmd: "group.send"; room: string; text: string }
+  | { cmd: "group.stop" | "group.disband"; room: string }
   | { cmd: "create"; name: string; description?: string }
   | { cmd: "delete"; name: string }
   | { cmd: "profile.get"; profile: string }
@@ -239,6 +245,23 @@ function errorDetail(detail: unknown): string {
     return d.error + saved;
   }
   return String(detail);
+}
+
+// One hosted-room log event as a panel row; turn bookkeeping (started/settled/activity) is dropped.
+function roomRow(e: Json): Json | null {
+  const p = (e.payload as Json | undefined) ?? {};
+  const a = (e.actor as Json | undefined) ?? {};
+  const member = String(p.member_id ?? a.display_name ?? a.profile ?? a.id ?? "");
+  switch (e.kind) {
+    case "message.user": return { seq: e.seq, role: "you", who: "you", text: String(p.text ?? "") };
+    case "message.member": return { seq: e.seq, role: "bot", who: String(a.display_name ?? a.profile ?? member), text: String(p.text ?? "") };
+    case "turn.failed": return { seq: e.seq, role: "status", who: member, text: `hit an error: ${String(p.error ?? p.reason_code ?? "").split("\n")[0]}` };
+    case "turn.cancelled": return { seq: e.seq, role: "status", who: member, text: "was stopped" };
+    case "member.unavailable": return { seq: e.seq, role: "status", who: member, text: "is unavailable" };
+    case "room.renamed": return { seq: e.seq, role: "status", who: "", text: `renamed to ${String(p.name ?? "")}` };
+    case "room.disbanded": return { seq: e.seq, role: "status", who: "", text: "group disbanded" };
+    default: return null;
+  }
 }
 
 const credPath = `${process.env.HOME}/.config/hermes-remote/credentials.env`;
@@ -1261,6 +1284,117 @@ class Remote {
     return `http://127.0.0.1:${this.screenServer.port}`;
   }
 
+  // Group chats are hosted rooms on the gateway. The log has no push events, so the room a panel
+  // has open is polled; every other room is only listed.
+  private openRoom = "";
+  private roomSeq = 0;
+  private roomTimer: ReturnType<typeof setInterval> | null = null;
+  private roomPolling = false;
+  private roomStatus = "";
+
+  async groups() {
+    const r = await this.rpc("groups.list", { limit: 50 });
+    emit({ ev: "groups", rooms: ((r.rooms as Json[]) ?? []).map((x) => ({
+      id: String(x.room_id), name: String(x.name ?? x.room_id),
+      members: ((x.members as Json[]) ?? []).map((m) => String(m.handle ?? m.profile ?? m.member_id)),
+      updatedAt: Number(x.updated_at ?? 0) })) });
+  }
+
+  async groupCreate(name: string, members: string[]) {
+    const title = String(name ?? "").trim();
+    if (!title) throw new RemoteError("a group name is required");
+    const bots = [...new Set(members ?? [])];
+    if (bots.length < 2 || bots.length > 6) throw new RemoteError("pick 2 to 6 bots for a group");
+    for (const p of bots) await this.requireProfile(p);
+    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "group";
+    const room = `${slug}-${Date.now().toString(36)}`;
+    await this.rpc("groups.create", { room_id: room, name: title,
+      members: bots.map((p) => ({ member_id: p, profile: p, handle: p, display_name: p })) });
+    await this.groups();
+    await this.groupOpen(room);
+  }
+
+  async groupOpen(room: string) {
+    this.groupClose();
+    // Start from the recent tail instead of replaying a long room from the first event.
+    const head = await this.rpc("groups.log", { room_id: room, since_seq: 0, limit: 1 });
+    this.openRoom = room;
+    this.roomSeq = Math.max(0, Number(head.latest_seq ?? 0) - 150);
+    emit({ ev: "group.opened", room });
+    await this.groupPoll();
+    this.roomTimer = setInterval(() => void this.groupPoll(), 2500);
+  }
+
+  groupClose() {
+    if (this.roomTimer) clearInterval(this.roomTimer);
+    this.roomTimer = null;
+    this.openRoom = "";
+    this.roomStatus = "";
+  }
+
+  private async groupPoll() {
+    const room = this.openRoom;
+    if (!room || this.roomPolling) return;
+    this.roomPolling = true;
+    try {
+      const rows: Json[] = [];
+      for (let page = 0; page < 10; page++) {
+        const r = await this.rpc("groups.log", { room_id: room, since_seq: this.roomSeq, limit: 200 });
+        if (room !== this.openRoom) return;
+        for (const e of (r.events as Json[]) ?? []) {
+          this.roomSeq = Math.max(this.roomSeq, Number(e.seq ?? 0));
+          const row = roomRow(e);
+          if (row && (row.role !== "bot" || String(row.text).trim())) rows.push(row);
+        }
+        if (r.has_more !== true) break;
+      }
+      const d = ((await this.rpc("groups.state", { room_id: room })).driver_status as Json | undefined) ?? {};
+      if (room !== this.openRoom) return;
+      const working = d.working === true;
+      const pending = ((d.pending_actions as Json[] | undefined) ?? []).length;
+      const status = `${working}/${pending}`;
+      // Idle polls stay quiet; every connected panel receives these broadcasts.
+      if (rows.length === 0 && status === this.roomStatus) return;
+      this.roomStatus = status;
+      emit({ ev: "group.log", room, rows, working, pending });
+    } catch (e) {
+      emit({ ev: "group.error", room, message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.roomPolling = false;
+    }
+  }
+
+  async groupSend(room: string, text: string) {
+    const body = String(text ?? "").trim();
+    if (!body) return;
+    const id = `puri-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    // A fresh thread per message, like a new topic in Hermes Desktop.
+    await this.rpc("groups.send", { room_id: room, event_id: id, payload: { text: body, thread_id: id } });
+    if (room === this.openRoom) await this.groupPoll();
+  }
+
+  async groupStop(room: string) {
+    const r = await this.rpc("groups.stop", { room_id: room });
+    emit({ ev: "group.stopped", room, cancelled: Number(r.cancelled ?? 0) });
+    if (room === this.openRoom) await this.groupPoll();
+  }
+
+  async groupDisband(room: string) {
+    await this.rpc("groups.disband", { room_id: room });
+    if (room === this.openRoom) this.groupClose();
+    emit({ ev: "group.disbanded", room });
+    await this.groups();
+  }
+
+  // Group failures belong to the Groups view; the generic error event would end the selected bot's turn state.
+  private async groupCommand(room: string, run: () => Promise<unknown>) {
+    try {
+      await run();
+    } catch (e) {
+      emit({ ev: "group.error", room, message: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   private screenCommand(profile: string, run: () => Promise<unknown>) {
     // Starting a screen can take seconds; keep the NDJSON loop free and report failures per bot.
     void run().catch((e) => emit({ ev: "screen.error", profile, message: e instanceof Error ? e.message : String(e) }));
@@ -1278,6 +1412,13 @@ class Remote {
       case "dictate.start": return this.dictateStart();
       case "dictate.stop": return this.dictateStop(c.profile);
       case "dictate.file": return this.transcribe(c.profile, c.path);
+      case "groups": return this.groupCommand("", () => this.groups());
+      case "group.create": return this.groupCommand("", () => this.groupCreate(c.name, c.members));
+      case "group.open": return this.groupCommand(c.room, () => this.groupOpen(c.room));
+      case "group.close": return this.groupClose();
+      case "group.send": return this.groupCommand(c.room, () => this.groupSend(c.room, c.text));
+      case "group.stop": return this.groupCommand(c.room, () => this.groupStop(c.room));
+      case "group.disband": return this.groupCommand(c.room, () => this.groupDisband(c.room));
       case "create": return this.create(c.name, c.description);
       case "delete": return this.remove(c.name);
       case "profile.get": return this.profileGet(c.profile);

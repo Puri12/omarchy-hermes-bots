@@ -116,6 +116,20 @@ Panel {
   property var screenByProfile: ({})
   property string screenBase: ""
   property bool showingRoutines: false
+  // Group chats (hosted rooms). The helper polls only the open room's log.
+  property bool showingGroups: false
+  property var groupRooms: []
+  property string openRoom: ""
+  property var roomRows: []
+  property bool roomWorking: false
+  property int roomPending: 0
+  property string roomError: ""
+  property var newGroupMembers: ({})
+  property string armedDisband: ""
+  readonly property var openRoomInfo: {
+    for (var i = 0; i < groupRooms.length; i++) if (groupRooms[i].id === openRoom) return groupRooms[i]
+    return null
+  }
   property var routinesByProfile: ({})
   property var routineRunsById: ({})
   property string routineRunsShown: ""
@@ -460,6 +474,33 @@ Panel {
     case "notice_clear":
       dismissNotice(ev.key)
       break
+    case "groups":
+      groupRooms = ev.rooms || []
+      break
+    case "group.opened":
+      openRoom = ev.room
+      roomRows = []
+      roomWorking = false
+      roomPending = 0
+      roomError = ""
+      break
+    case "group.log":
+      if (ev.room !== openRoom) break
+      if (ev.rows.length > 0) roomRows = roomRows.concat(ev.rows).slice(-150)
+      roomWorking = ev.working === true
+      roomPending = ev.pending || 0
+      break
+    case "group.error":
+      if (ev.room === "" || ev.room === openRoom) roomError = ev.message
+      break
+    case "group.disbanded":
+      if (ev.room === openRoom) {
+        openRoom = ""
+        roomRows = []
+        roomWorking = false
+        roomError = ""
+      }
+      break
     case "template.exported":
       lastTemplate = ev.path
       pushMessage(ev.profile, "tool", "📦 template saved: " + ev.path + " (" + ev.skills + " skills, " + ev.routines + " routines)")
@@ -752,6 +793,64 @@ Panel {
   function toggleRoutines() {
     showingRoutines = !showingRoutines
     if (showingRoutines) refreshRoutines()
+  }
+
+  function toggleGroups() {
+    showingGroups = !showingGroups
+    roomError = ""
+    if (showingGroups) {
+      sendCommand({ cmd: "groups" })
+      if (openRoom !== "") sendCommand({ cmd: "group.open", room: openRoom })
+    } else if (openRoom !== "") {
+      sendCommand({ cmd: "group.close" })
+    }
+  }
+
+  function openGroup(id) {
+    armedDisband = ""
+    roomError = ""
+    sendCommand({ cmd: "group.open", room: id })
+  }
+
+  function closeRoom() {
+    if (openRoom !== "") sendCommand({ cmd: "group.close" })
+    openRoom = ""
+    roomRows = []
+    roomWorking = false
+    roomPending = 0
+    armedDisband = ""
+    sendCommand({ cmd: "groups" })
+  }
+
+  function toggleGroupMember(name) {
+    var m = Object.assign({}, newGroupMembers)
+    if (m[name]) delete m[name]
+    else m[name] = true
+    newGroupMembers = m
+  }
+
+  function createGroup(name) {
+    var title = String(name || "").trim()
+    var members = Object.keys(newGroupMembers)
+    if (title === "") { roomError = "name the group first"; return false }
+    if (members.length < 2 || members.length > 6) { roomError = "pick 2 to 6 bots"; return false }
+    roomError = ""
+    sendCommand({ cmd: "group.create", name: title, members: members })
+    newGroupMembers = ({})
+    return true
+  }
+
+  function sendToRoom(text) {
+    var body = String(text || "").trim()
+    if (openRoom === "" || body === "") return false
+    sendCommand({ cmd: "group.send", room: openRoom, text: body })
+    return true
+  }
+
+  function requestDisband() {
+    if (armedDisband !== openRoom) { armedDisband = openRoom; return }
+    sendCommand({ cmd: "group.disband", room: openRoom })
+    armedDisband = ""
   }
 
   function refreshRoutines() {
@@ -1104,6 +1203,20 @@ Panel {
     function templateExport(): string { root.sendCommand({ cmd: "template.export", profile: root.selected }); return "exporting" }
     function lastTemplate(): string { return root.lastTemplate }
     function templateImport(path: string, name: string): string { root.sendCommand({ cmd: "template.import", path: path, name: name }); return "importing" }
+    function groupsView(): string { root.toggleGroups(); return root.showingGroups ? "shown" : "hidden" }
+    function groups(): string { return JSON.stringify(root.groupRooms) }
+    function groupCreate(name: string, membersCsv: string): string {
+      root.newGroupMembers = ({})
+      membersCsv.split(",").forEach(function(m) { if (m.trim() !== "") root.toggleGroupMember(m.trim()) })
+      return root.createGroup(name) ? "creating" : root.roomError
+    }
+    function groupOpen(id: string): string { root.openGroup(id); return "opening" }
+    function groupSend(text: string): string { return root.sendToRoom(text) ? "sent" : "no-room-or-empty" }
+    function groupDisband(id: string): string { root.sendCommand({ cmd: "group.disband", room: id }); return "disbanding" }
+    function room(): string {
+      return JSON.stringify({ open: root.openRoom, working: root.roomWorking, pending: root.roomPending,
+        error: root.roomError, count: root.roomRows.length, rows: root.roomRows.slice(-8) })
+    }
     function dictateFile(path: string): string { root.sendCommand({ cmd: "dictate.file", profile: root.selected, path: path }); return "transcribing" }
     // Test hook: run a raw gateway frame (JSON) through the helper's event mapping.
     function injectFrame(json: string): string { root.sendCommand({ cmd: "inject", frame: JSON.parse(json) }); return "injected" }
@@ -1247,7 +1360,11 @@ Panel {
   onOpenedChanged: if (opened) {
     sendCommand({ cmd: "refresh" })
     ensureLoaded(selected)
+    if (showingGroups && openRoom !== "") sendCommand({ cmd: "group.open", room: openRoom })
     Qt.callLater(function() { input.forceActiveFocus() })
+  } else if (openRoom !== "") {
+    // A room's log is polled only while the panel shows it.
+    sendCommand({ cmd: "group.close" })
   }
 
     BarIconButton {
@@ -1284,7 +1401,7 @@ Panel {
         || clarifyField.activeFocus || modelField.activeFocus || attachField.activeFocus
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
-        || importPathField.activeFocus || importNameField.activeFocus
+        || importPathField.activeFocus || importNameField.activeFocus || groupNameField.activeFocus || roomInput.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -1459,6 +1576,16 @@ Panel {
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               onClicked: root.toggleRoutines()
+            }
+
+            Button {
+              text: root.showingGroups && root.roomWorking ? "Groups …" : "Groups"
+              bordered: true
+              selected: root.showingGroups
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.toggleGroups()
             }
 
             Button {
@@ -1648,6 +1775,251 @@ Panel {
                 }
               }
             }
+          }
+        }
+
+        // Group chats: the room list and a New group form, or the open room with its own composer.
+        Column {
+          visible: root.showingGroups
+          width: parent.width
+          spacing: Style.space(4)
+
+          Text {
+            visible: root.roomError !== ""
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "⚠ " + root.roomError
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            visible: root.openRoom === "" && root.groupRooms.length === 0
+            text: "No group chats yet."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.openRoom === "" ? root.groupRooms : []
+            Item {
+              required property var modelData
+              width: parent.width
+              implicitHeight: roomLine.implicitHeight + Style.space(8)
+
+              Rectangle {
+                anchors.fill: parent
+                radius: Style.cornerRadius
+                color: roomMouse.containsMouse ? root.alpha(root.foreground, 0.1) : "transparent"
+              }
+
+              MouseArea {
+                id: roomMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openGroup(modelData.id)
+              }
+
+              Text {
+                id: roomLine
+                x: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - Style.space(16)
+                elide: Text.ElideRight
+                text: "👥 " + modelData.name + "  ·  " + modelData.members.map(function(m) { return "@" + m }).join(" ")
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          Text {
+            visible: root.openRoom === ""
+            text: "New group: pick 2 to 6 bots"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Flow {
+            visible: root.openRoom === ""
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Repeater {
+              model: root.rosterProfiles
+              Button {
+                required property var modelData
+                text: "@" + modelData.name
+                bordered: true
+                selected: root.newGroupMembers[modelData.name] === true
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.toggleGroupMember(modelData.name)
+              }
+            }
+          }
+
+          Item {
+            visible: root.openRoom === ""
+            width: parent.width
+            implicitHeight: Math.max(groupNameField.implicitHeight, createGroupButton.implicitHeight)
+
+            TextField {
+              id: groupNameField
+              anchors.left: parent.left
+              anchors.right: createGroupButton.left
+              anchors.rightMargin: Style.spacing.sm
+              anchors.verticalCenter: parent.verticalCenter
+              placeholderText: "group name"
+              foreground: root.foreground
+              onAccepted: if (root.createGroup(text)) text = ""
+            }
+
+            Button {
+              id: createGroupButton
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Create group"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: if (root.createGroup(groupNameField.text)) groupNameField.text = ""
+            }
+          }
+
+          Item {
+            visible: root.openRoom !== ""
+            width: parent.width
+            implicitHeight: roomActions.implicitHeight
+
+            Text {
+              anchors.left: parent.left
+              anchors.right: roomActions.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              elide: Text.ElideRight
+              text: "👥 " + (root.openRoomInfo ? root.openRoomInfo.name + "  ·  "
+                + root.openRoomInfo.members.map(function(m) { return "@" + m }).join(" ") : root.openRoom)
+              color: root.foreground
+              font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              id: roomActions
+              anchors.right: parent.right
+              spacing: Style.spacing.sm
+
+              Button {
+                visible: root.roomWorking
+                text: "Stop"
+                bordered: true
+                foreground: root.urgent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.sendCommand({ cmd: "group.stop", room: root.openRoom })
+              }
+
+              Button {
+                text: root.armedDisband === root.openRoom ? "Click again to delete group" : "Delete group"
+                bordered: true
+                foreground: root.armedDisband === root.openRoom ? root.urgent : root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.requestDisband()
+              }
+
+              Button {
+                text: "‹ Groups"
+                bordered: true
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.closeRoom()
+              }
+            }
+          }
+
+          Rectangle {
+            visible: root.openRoom !== ""
+            width: parent.width
+            height: Style.space(210)
+            radius: Style.cornerRadius
+            color: root.alpha(root.foreground, 0.04)
+
+            ListView {
+              id: roomView
+              anchors.fill: parent
+              anchors.margins: Style.space(6)
+              clip: true
+              spacing: Style.space(6)
+              model: root.roomRows
+              onCountChanged: Qt.callLater(function() { roomView.positionViewAtEnd() })
+
+              delegate: Column {
+                required property var modelData
+                width: roomView.width
+                spacing: Style.space(1)
+
+                Text {
+                  visible: modelData.role !== "status"
+                  text: modelData.role === "you" ? "you" : "@" + modelData.who
+                  color: modelData.role === "you" ? root.dim : root.linkColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.Wrap
+                  text: modelData.role === "bot" ? root.colorLinks(root.displayText(modelData.text))
+                    : modelData.role === "status" ? (modelData.who ? "@" + modelData.who + " " : "") + modelData.text
+                    : modelData.text
+                  textFormat: modelData.role === "bot" ? Text.MarkdownText : Text.PlainText
+                  color: modelData.role === "status" ? root.dim : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: modelData.role === "status" ? Style.font.caption : Style.font.bodySmall
+                  onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                }
+              }
+            }
+
+            Text {
+              anchors.centerIn: parent
+              visible: root.roomRows.length === 0
+              text: "No messages yet. @mention a bot, or write to everyone."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Text {
+            visible: root.openRoom !== "" && (root.roomWorking || root.roomPending > 0)
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: (root.roomWorking ? "… bots are replying" : "")
+              + (root.roomPending > 0 ? (root.roomWorking ? "  ·  " : "") + root.roomPending + " approval(s) waiting, answer them in Hermes Desktop" : "")
+            color: root.roomPending > 0 ? root.urgent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          TextField {
+            id: roomInput
+            visible: root.openRoom !== ""
+            width: parent.width
+            placeholderText: "Message the group  (@bot to address one)"
+            foreground: root.foreground
+            onAccepted: if (root.sendToRoom(text)) text = ""
           }
         }
 
