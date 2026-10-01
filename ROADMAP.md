@@ -55,6 +55,14 @@
 | 22 | **대화 기록 정리 표시** — 다시 불러온 대화에서 첨부 확장문(`--- Attached Context ---`)과 cron 내부 지시문이 내 말풍선으로 보이는 것 숨기기 | S | 항목 4·5 캡처에서 발견 |
 | 23 | **P2 조사 보완** — 초안 카드(항목 11) 백엔드 조사 미완 | S | 조사 노드 취소로 r11 보고서 없음 |
 
+## 로드맵 추가 후보 (개발 중 발견, 2026-10-01)
+
+| # | 기능 | 크기 | 근거 |
+|---|---|---|---|
+| 24 | **그룹 방 안 승인 처리** — 방에서 봇이 명령 승인을 요청하면 패널에서 바로 답하기(`groups.approve`) | S | 지금은 대기 개수만 표시 |
+| 25 | **그룹 방 관리** — 이름 바꾸기(`groups.rename`), 멤버 바꾸기, 특정 답에 스레드로 이어 말하기 | M | Hermes Desktop의 그룹 설정 |
+| 26 | **그룹 방 알림** — 보고 있지 않은 방에서 봇이 `@user`로 부르거나 답이 오면 알림·안 읽음 표시 | M | 지금은 열린 방만 폴링 |
+
 ## 진행 상황
 
 | # | 상태 | 증거 |
@@ -70,8 +78,15 @@
 | 17 | ✅ 완료(추가 후보) — 헬퍼가 재시작돼 넘겨받은 화면의 권한을 잃어도 Hand back이 강제 해제로 봇에게 돌려줌(VM lease: human → agent 확인) | `.omo/mass-ulw/NOTEPAD.md` |
 | 19 | ✅ 완료(추가 후보) — 모델 줄에 `context N% · 67.1k tokens` 사용량 표시 | `.omo/mass-ulw/evidence/item19-usage.png` |
 | 9 | ✅ 완료 — 입력창 `/` 스킬 자동완성, `command.dispatch`로 실행, Save as skill | 커밋 `af7a181` |
-| 12 | 🟡 거의 완료 — 안 읽음 표시(`•`)·대화 검색·답장 인용 완료, 키보드 단축키만 다음 작업 | 커밋 `ae8d1ce` 외 |
-| 8, 10, 11 | ⏳ 다음 작업 — 그룹 채팅, 음성, 초안 카드(조사 필요) | |
+| 12 | ✅ 완료 — 안 읽음 표시(`•`)·대화 검색·답장 인용·키보드 단축키(Ctrl+N/K/F/↑, Alt+1…9) | 커밋 `ae8d1ce`, `37abd1d` |
+| 20 | ✅ 완료(추가 후보) — 서버 공지(크레딧·지연·속도 제한·모델 대체)를 색 배너로, 시간제 공지는 자동으로 사라짐 | 커밋 `76d4483`, `.omo/ulw-r5/evidence/item20-notices.png` |
+| 16 | ✅ 완료(추가 후보) — 위임(delegate_task) 시작·진행·완료를 대화와 상태줄에 표시 | 커밋 `9a5662b`, `item16-running.png` |
+| 10 | ✅ 완료 — 봇 답 🔊 읽어 주기(서버 TTS → `pw-play`), Mic 받아쓰기(`pw-record` → 서버 STT). **받아쓰기는 서버에 STT 엔진(예: faster-whisper)이 있어야 함** — 지금 VM은 "No STT provider available"을 돌려줌(사용자 몫) | 커밋 `9e920de`, `item10-voice.png` |
+| 14 | ✅ 완료 — 봇 템플릿 Export/Import(역할·SOUL·모델·직접 만든 스킬·루틴) | 커밋 `71eb91d`, `item14-template.png` |
+| 8 | ✅ 완료 — Groups 화면: 서버 그룹 방 목록, 봇 2–6개로 만들기, 방 대화(전체 또는 `@봇`), Stop, 삭제. 열린 방 기록은 2.5초마다 받아 옴(서버가 푸시하지 않음). 방 안 명령 승인은 개수만 표시하고 답은 Hermes Desktop에서 | 커밋 `b8fc7f2`, `item8-groups.png` |
+| 13 | ✅ 완료 — Record demo로 봇 화면을 넘겨받아 시연, Stop & teach로 입력(클릭·드래그·스크롤·글자·단축키)을 단계로 봇에 전달 → 봇의 SKILL.md 초안 카드 → Save skill | 커밋 `6dcbc53`, `item13-demo.png` |
+| 11 | ✅ 패널 쪽 완료, **서버 플러그인 켜기는 사용자 몫** — 발송 초안 카드(Send/Edit…/Discard)와 서버 플러그인 `hermes-plugin/outbound-review`. 플러그인을 봇의 `plugins.enabled`에 넣고 Hermes를 재시작해야 카드가 뜸(README). 카드는 주입한 승인 요청으로, 플러그인 로직은 VM 파이썬으로 검증. 실제 발송 경로 끝까지는 미검증 | 커밋 `8f0d845`, `item11-draft.png` |
+| 23 | ✅ 완료 — 초안 카드 백엔드 조사 | `.omo/ulw-r5/r11-drafts.md` |
 | 18, 21, 22 | ✅ 완료(추가 후보) — History에서 이름 바꾸기·보관·삭제, 패널 넘침 전수 점검, cron 지시문·첨부 확장문 접기 | 커밋 `4596f42` |
 | 여러 줄 입력·링크 색·Reconnect | ✅ 완료 — Shift+Enter 줄바꿈, 링크 강조색, 연결 끊김 시 다시 연결 | 커밋 `0258bed` 외 |
 | 결함 | ✅ 새 대화 직후 전송 경쟁 조건, History 넘침, 봇 버튼 줄 겹침, 루틴 과잉 제한 수정 | `evidence/race.md`, `history-overflow.png`, `actions-row.png` |
