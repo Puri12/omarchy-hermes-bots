@@ -43,6 +43,21 @@ Panel {
   property var activityByProfile: ({})
   property var todosByProfile: ({})
   property var unreadProfiles: ({})
+  property var lastSentByProfile: ({})
+  function toggleSearch() {
+    searching = !searching
+    if (searching) Qt.callLater(function() { searchField.forceActiveFocus() })
+    else { searchText = ""; searchField.text = ""; input.forceActiveFocus() }
+  }
+  function selectNth(n) {
+    if (n < rosterProfiles.length) selected = rosterProfiles[n].name
+  }
+  function recallLastSent() {
+    var last = lastSentByProfile[selected]
+    if (input.text !== "" || !last) return
+    input.text = last
+    input.cursorPosition = input.length
+  }
   property bool searching: false
   // Text of a transcript row the next message replies to (right-click a bubble); sent as a > quote.
   property string quoteText: ""
@@ -620,6 +635,7 @@ Panel {
   // The helper prepends the pending @file: refs to the prompt; the bubble lists the files as chips.
   function sendTextForProfile(profile, text, images, files) {
     if (text === "") text = images.length > 0 ? "(image)" : "(file)"
+    lastSentByProfile[profile] = text
     pushMessage(profile, "you", text, images, (files || []).map(function(f) { return { name: f.name, local: f.local } }))
     pendingByProfile[profile] = []
     pendingFilesByProfile[profile] = []
@@ -1162,6 +1178,21 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
+      // Window shortcuts: they fire while the panel has keyboard focus, including from the composer.
+      Shortcut { sequence: "Ctrl+N"; enabled: root.opened; onActivated: root.newChat() }
+      Shortcut { sequence: "Ctrl+K"; enabled: root.opened; onActivated: root.toggleSessions() }
+      Shortcut { sequence: "Ctrl+F"; enabled: root.opened; onActivated: root.toggleSearch() }
+      Shortcut { sequence: "Ctrl+Up"; enabled: root.opened; onActivated: root.recallLastSent() }
+      Shortcut { sequence: "Alt+1"; enabled: root.opened; onActivated: root.selectNth(0) }
+      Shortcut { sequence: "Alt+2"; enabled: root.opened; onActivated: root.selectNth(1) }
+      Shortcut { sequence: "Alt+3"; enabled: root.opened; onActivated: root.selectNth(2) }
+      Shortcut { sequence: "Alt+4"; enabled: root.opened; onActivated: root.selectNth(3) }
+      Shortcut { sequence: "Alt+5"; enabled: root.opened; onActivated: root.selectNth(4) }
+      Shortcut { sequence: "Alt+6"; enabled: root.opened; onActivated: root.selectNth(5) }
+      Shortcut { sequence: "Alt+7"; enabled: root.opened; onActivated: root.selectNth(6) }
+      Shortcut { sequence: "Alt+8"; enabled: root.opened; onActivated: root.selectNth(7) }
+      Shortcut { sequence: "Alt+9"; enabled: root.opened; onActivated: root.selectNth(8) }
+
       Column {
         id: header
         width: parent.width
@@ -1296,11 +1327,7 @@ Panel {
               foreground: root.dim
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
-              onClicked: {
-                root.searching = !root.searching
-                if (root.searching) Qt.callLater(function() { searchField.forceActiveFocus() })
-                else { root.searchText = ""; searchField.text = "" }
-              }
+              onClicked: root.toggleSearch()
             }
 
             TextField {
