@@ -87,6 +87,9 @@
 | 13 | ✅ 완료 — Record demo로 봇 화면을 넘겨받아 시연, Stop & teach로 입력(클릭·드래그·스크롤·글자·단축키)을 단계로 봇에 전달 → 봇의 SKILL.md 초안 카드 → Save skill | 커밋 `6dcbc53`, `item13-demo.png` |
 | 11 | ✅ 패널 쪽 완료, **서버 플러그인 켜기는 사용자 몫** — 발송 초안 카드(Send/Edit…/Discard)와 서버 플러그인 `hermes-plugin/outbound-review`. 플러그인을 봇의 `plugins.enabled`에 넣고 Hermes를 재시작해야 카드가 뜸(README). 카드는 주입한 승인 요청으로, 플러그인 로직은 VM 파이썬으로 검증. 실제 발송 경로 끝까지는 미검증 | 커밋 `8f0d845`, `item11-draft.png` |
 | 23 | ✅ 완료 — 초안 카드 백엔드 조사 | `.omo/ulw-r5/r11-drafts.md` |
+| 24 | ✅ 완료 — 방 안 명령 승인 카드(Approve once / Deny, `groups.approve`)와 알림, 결과 없이 끝난 턴의 Retry 카드(`groups.retry`). 이전의 "승인 N개 대기" 문구는 재시도 항목까지 승인으로 잘못 세던 것이라 바로잡음. Retry 카드는 실제로 띄워 보지 못해 코드로만 확인 | 커밋 `4859882`, `item24-room-approval.png` |
+| 25 | ✅ 완료(멤버 바꾸기 제외) — Rename(`groups.rename`), 메시지를 눌러 같은 스레드로 답하기. **멤버 바꾸기는 게이트웨이에 RPC가 없어 할 수 없음** | 커밋 `f093050`, `item25-thread.png` |
+| 26 | ✅ 완료 — 보고 있지 않은 방을 헬퍼가 20초마다 확인해 봇의 새 메시지를 알림(`@user`/`@all`은 긴급)과 `•` 표시로 알리고, 알림을 누르면 그 방이 열림 | 커밋 `81a5eee`, `item26-room-notify.png` |
 | 18, 21, 22 | ✅ 완료(추가 후보) — History에서 이름 바꾸기·보관·삭제, 패널 넘침 전수 점검, cron 지시문·첨부 확장문 접기 | 커밋 `4596f42` |
 | 여러 줄 입력·링크 색·Reconnect | ✅ 완료 — Shift+Enter 줄바꿈, 링크 강조색, 연결 끊김 시 다시 연결 | 커밋 `0258bed` 외 |
 | 결함 | ✅ 새 대화 직후 전송 경쟁 조건, History 넘침, 봇 버튼 줄 겹침, 루틴 과잉 제한 수정 | `evidence/race.md`, `history-overflow.png`, `actions-row.png` |
