@@ -45,6 +45,7 @@ type Command =
   | { cmd: "profile.save"; profile: string; description?: string; soul?: string }
   | { cmd: "profile.duplicate"; profile: string; newName: string }
   | { cmd: "profile.pin" | "profile.hide"; profile: string; value: boolean }
+  | { cmd: "profile.section"; profile: string; section: string }
   | { cmd: "new"; profile: string }
   | { cmd: "load"; profile: string }
   | { cmd: "send"; profile: string; text: string }
@@ -475,8 +476,12 @@ class Remote {
       };
     });
     this.knownProfiles = new Set(["default", ...profiles.map((x) => String(x.name))]);
+    // A broken sections file must not take the roster down with it; it is reported on the next write.
+    const layout = await this.readSections().catch(() => ({ sections: [] as string[], assign: {} as Record<string, string> }));
+    const sections = { order: layout.sections,
+      assign: Object.fromEntries(Object.entries(layout.assign).map(([bot, name]) => [bot.toLowerCase(), name])) };
     return { ev: "status", ok: true, url: this.creds.url, version: s.version,
-      gatewayRunning: s.gateway_running === true, activeSessions: s.active_sessions, profiles };
+      gatewayRunning: s.gateway_running === true, activeSessions: s.active_sessions, profiles, sections };
   }
 
   private async socket(): Promise<WebSocket> {
@@ -1239,6 +1244,51 @@ class Remote {
     emit(await this.status());
   }
 
+  // Roster sections live in the file the hermes-bot-kit Desktop plugin reads, so Hermes Desktop
+  // with that kit shows the same layout: "sections" is the order, "assign" maps a bot to one.
+  sectionsPath = `${process.env.HERMES_HOME || `${process.env.HOME}/.hermes`}/bot-sections.json`;
+
+  async readSections() {
+    const file = Bun.file(this.sectionsPath);
+    let raw: Json = {};
+    if (await file.exists()) {
+      try { raw = JSON.parse(await file.text()) as Json; } catch { throw new RemoteError(`${this.sectionsPath} is not valid JSON`); }
+    }
+    const sections: string[] = [];
+    const add = (name: unknown) => {
+      const s = String(name ?? "").trim();
+      if (s === "" || s.toLowerCase() === "unassigned") return "";
+      const known = sections.find((x) => x.toLowerCase() === s.toLowerCase());
+      if (!known) sections.push(s);
+      return known ?? s;
+    };
+    for (const s of Array.isArray(raw.sections) ? raw.sections : []) add(s);
+    const assign: Record<string, string> = {};
+    for (const [bot, s] of Object.entries((raw.assign as Json | undefined) ?? {})) {
+      const name = add(s);
+      if (name !== "") assign[bot] = name;
+    }
+    return { raw, sections, assign };
+  }
+
+  async profileSection(profile: string, section: string) {
+    await this.requireProfile(profile);
+    const layout = await this.readSections();
+    const key = Object.keys(layout.assign).find((k) => k.toLowerCase() === profile.toLowerCase());
+    const left = key ? layout.assign[key] : "";
+    if (key) delete layout.assign[key];
+    const name = section.trim();
+    if (name !== "" && name.toLowerCase() !== "unassigned") {
+      const known = layout.sections.find((s) => s.toLowerCase() === name.toLowerCase());
+      if (!known) layout.sections.push(name);
+      layout.assign[profile] = known ?? name;
+    }
+    // A section lasts as long as a bot is in it: drop the one this bot just emptied.
+    if (left !== "" && !Object.values(layout.assign).includes(left)) layout.sections = layout.sections.filter((s) => s !== left);
+    await Bun.write(this.sectionsPath, JSON.stringify({ ...layout.raw, sections: layout.sections, assign: layout.assign }, null, 2) + "\n");
+    emit(await this.status());
+  }
+
   async profileFlag(profile: string, flag: "pinned" | "hidden", value: boolean) {
     await this.requireProfile(profile);
     const cur = (await this.botMeta()).get(profile) ?? { meta: {}, rev: 0 };
@@ -1634,6 +1684,7 @@ class Remote {
       case "profile.get": return this.profileGet(c.profile);
       case "profile.save": return this.profileSave(c.profile, c.description, c.soul);
       case "profile.duplicate": return this.profileDuplicate(c.profile, c.newName);
+      case "profile.section": return this.profileSection(c.profile, c.section);
       case "profile.pin":
       case "profile.hide":
         return this.profileFlag(c.profile, c.cmd === "profile.pin" ? "pinned" : "hidden", c.value === true);

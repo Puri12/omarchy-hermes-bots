@@ -9,6 +9,8 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 ## 기능
 
 - 봇 목록·생성·삭제(2단계 확인)·모델 변경, 봇 설명/SOUL 편집·복제·고정·숨김
+- 봇 구역: Edit의 **SECTION**에서 봇을 이름 붙인 구역으로 옮김(구역 칩을 누르거나 새 이름을 넣고 **Move**, 자기 구역 칩을 다시 누르면 해제). 봇 목록은 구역 순서대로 묶여 보이고 구역에 없는 봇은 맨 아래 UNASSIGNED에 모임. 마지막 봇이 나가면 그 구역은 사라짐. 배치는 노트북의 `~/.hermes/bot-sections.json`에 [hermes-bot-kit](https://github.com/thomasbek3/hermes-bot-kit)의 Bot Sections와 같은 형식(`sections` 순서, `assign` 봇→구역)으로 저장되어, Hermes Desktop에 그 키트를 깔면 같은 배치가 보임. 파일을 직접 고치면 최대 1분 안에 반영 (IPC `section <name>`, `sections`)
+- 패널 구성: History·Groups·Routines·Edit·모델·새 봇 구역은 한 번에 하나만 열리고, 길어지면 그 안에서 스크롤됨. Edit와 열린 그룹 방은 대화 자리를 대신 씀. 입력줄의 받아쓰기·첨부·모델·새 대화는 아이콘 버튼(마우스를 올리면 설명), 봇 삭제는 Edit 맨 아래로 옮김. 서버 주소는 상태줄에 마우스를 올리면 보임
 - 봇 목록 상태 표시: `?` 답을 기다림 · `…` 작업 중 · `⏱` 예약 작업 실행 중 · `•` 보지 않는 동안 새 답장·알림 (선택하면 지워짐, IPC `unread`)
 - 대화 검색: History 옆 **Search**로 현재 대화에서 글자가 들어간 줄만 표시(일치 수 표시, Esc로 닫기, IPC `search <text>`)
 - 답장 인용: 말풍선을 오른쪽 클릭하면 입력창 위에 `↩ replying to`가 뜨고, 보낼 때 `> ` 인용으로 앞에 붙음(× 로 취소, IPC `quote <index>`)
@@ -21,6 +23,7 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 - 발송 초안 카드: 봇이 `send_message`로 메시지를 보내려 하면 수신자와 본문을 카드로 보여 주고 **Send**를 눌러야만 발송됨. **Discard**는 폐기, **Edit…**는 폐기한 뒤 고쳐 보낼 지시문을 입력창에 채워 줌(봇이 다시 보내려 하면 새 초안 카드). 이번 한 번만 승인하는 버튼만 두어 이후 발송이 검토 없이 나가지 않음. 서버 쪽에 아래 `outbound-review` Hermes 플러그인이 켜져 있어야 동작함
 - 그룹 채팅: **Groups**에서 봇 2~6개를 골라 이름을 넣고 **Create group**. 방을 열면 모두에게, 또는 `@봇`으로 한 봇에게 말을 걸 수 있고 봇들이 Hermes Desktop 그룹 채팅과 같은 서버 방(hosted room)에서 차례로 답함. 패널이 열려 있고 방을 보고 있는 동안만 방 기록을 2.5초마다 받아 옴. 답하는 중이면 **Stop**, **Delete group**(두 번 클릭)으로 방 삭제, **Rename**으로 이름 바꾸기. 방의 메시지를 클릭하면 그 스레드로 이어서 답함(봇 메시지면 `@봇`이 입력칸에 채워짐, × 로 취소). 멤버 바꾸기는 서버 RPC가 없어 지원하지 않음. 보고 있지 않은 방은 헬퍼가 20초마다 확인해 봇의 새 메시지가 오면 데스크톱 알림(`@user`·`@all`로 부르면 긴급)과 Groups 버튼·방 목록의 `•` 표시를 띄우고, 알림을 누르면 그 방이 열림(IPC `groupUnread`, `showGroup <id>`). 방에서 봇이 명령 승인을 요청하면 방 화면에 카드(**Approve once** / **Deny**)가 뜨고 알림이 오며, 결과 없이 끝난 턴은 **Retry** 카드로 다시 실행할 수 있음 (IPC `groupsView groups groupCreate <name> <bot,bot> groupOpen <id> groupSend <text> groupDisband <id> room roomAnswer <once|deny>`)
 - 스트리밍 답변, 작업 상태줄(thinking/writing/도구·경과 시간), 봇의 할 일 목록, 토큰·컨텍스트 사용량
+- 답변 Markdown: 코드 블록은 말풍선 폭 안에서 줄바꿈되고 코드 조각은 본문과 같은 크기로 표시, Markdown 이미지(`![]()`)는 링크로 표시. 스트리밍 중에는 답변의 마지막 덩어리만 다시 그림(`MarkdownBody.qml`)
 - 작업 중 추가 지시(Steer/Queue), 중지
 - 질문(clarify)·승인 카드, 긴급 알림, 루틴(cron) 완료 알림
 - 이미지·파일 보내기/받기(파일 칩), 대화 History(대화마다 이름 바꾸기·보관·삭제, 삭제는 두 번 클릭), 다시 불러온 대화의 cron 지시문·첨부 확장문은 접어서 표시(클릭하면 전체)

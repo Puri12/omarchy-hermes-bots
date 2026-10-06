@@ -19,6 +19,9 @@ Panel {
 
   property bool connected: false
   property string statusLine: "Connecting…"
+  property string serverHost: ""
+  // Edit and an open group room are modes of their own: they take the chat's place instead of squeezing it.
+  readonly property bool drawerTakesOver: editing || (showingGroups && openRoom !== "")
   property string lastError: ""
   property var profiles: []
   property string selected: "default"
@@ -106,6 +109,27 @@ Panel {
     if (q === "") return messages
     return messages.filter(function(m) { return String(m.text || "").toLowerCase().indexOf(q) >= 0 })
   }
+  // The chat shows chatModel, which mirrors shownMessages one row at a time. With the array itself as
+  // the model, every streamed chunk rebuilt every bubble and parsed its Markdown again, which froze
+  // the shell for as long as a reply took.
+  ListModel { id: chatModel }
+  property var chatRows: []
+  onShownMessagesChanged: syncChat()
+  function syncChat() {
+    var next = shownMessages, prev = chatRows
+    var head = 0
+    while (head < prev.length && head < next.length && prev[head] === next[head]) head++
+    var tail = 0
+    while (tail < prev.length - head && tail < next.length - head
+           && prev[prev.length - 1 - tail] === next[next.length - 1 - tail]) tail++
+    // Only the rows between the unchanged head and tail differ: rewrite those that stay, then drop
+    // or add the rest.
+    var was = prev.length - head - tail, now = next.length - head - tail, i
+    for (i = 0; i < Math.min(was, now); i++) chatModel.setProperty(head + i, "row", JSON.stringify(next[head + i]))
+    if (was > now) chatModel.remove(head + now, was - now)
+    for (i = was; i < now; i++) chatModel.insert(head + i, { row: JSON.stringify(next[head + i]) })
+    chatRows = next
+  }
   property var usageByProfile: ({})
   readonly property var selectedTodos: { revision; return todosByProfile[selected] || [] }
   property var cronRunning: ({})
@@ -160,10 +184,34 @@ Panel {
     }).slice(0, 6)
   }
 
-  // Pinned bots first (order otherwise kept); hidden bots only with "Show hidden".
-  readonly property var rosterProfiles: {
+  // Named roster sections. The helper keeps them in ~/.hermes/bot-sections.json, the hermes-bot-kit
+  // format, so Hermes Desktop with that kit shows the same layout.
+  property var sectionOrder: []
+  property var sectionByBot: ({})
+  function sectionOf(name) { return sectionByBot[String(name).toLowerCase()] || "" }
+  readonly property string selectedSection: sectionOf(selected)
+  function setSection(name) {
+    lastError = ""
+    sendCommand({ cmd: "profile.section", profile: selected, section: String(name).trim() })
+  }
+
+  // The roster as drawn: one group per section in order, then the bots in none. Pinned bots lead
+  // each group; hidden bots only with "Show hidden".
+  readonly property var rosterGroups: {
     var shown = profiles.filter(function(p) { return showHidden || !p.hidden })
-    return shown.filter(function(p) { return p.pinned }).concat(shown.filter(function(p) { return !p.pinned }))
+    var ordered = shown.filter(function(p) { return p.pinned }).concat(shown.filter(function(p) { return !p.pinned }))
+    var groups = sectionOrder.map(function(s) {
+      return { name: s, bots: ordered.filter(function(p) { return root.sectionOf(p.name) === s }) }
+    }).filter(function(g) { return g.bots.length > 0 })
+    var rest = ordered.filter(function(p) { return root.sectionOf(p.name) === "" })
+    // The bots in no section get a heading only when there are sections above them.
+    if (rest.length > 0 || groups.length === 0) groups.push({ name: groups.length > 0 ? "Unassigned" : "", bots: rest })
+    return groups
+  }
+  readonly property var rosterProfiles: {
+    var all = []
+    rosterGroups.forEach(function(g) { all = all.concat(g.bots) })
+    return all
   }
   readonly property int hiddenCount: profiles.filter(function(p) { return p.hidden }).length
   readonly property var selectedInfo: { revision; return profileInfo[selected] || null }
@@ -293,35 +341,19 @@ Panel {
   readonly property var pendingImages: { revision; return pendingByProfile[selected] || [] }
   readonly property var pendingFiles: { revision; return pendingFilesByProfile[selected] || [] }
 
+  // Prompts reloaded from history carry the gateway's "@image:/path" and "@file:/path" lines.
+  function attachmentRefs(text) {
+    return text.replace(/^@(image|file):(\S+)\s*$/gm, function(m, kind, path) {
+      return (kind === "image" ? "󰋩 " : "󰈔 ") + path.split("/").pop()
+    })
+  }
+
   function displayText(text) {
     return String(text || "").split("\n").filter(function(l) { return !/^\s*MEDIA:\S+\s*$/.test(l) }).join("\n").trim()
   }
 
   // Theme accent, or a light blue when the theme's accent equals the text colour.
   readonly property color linkColor: Qt.colorEqual(Color.accent, foreground) ? "#8ab4f8" : Color.accent
-
-  // Qt's Markdown renderer ignores Text.linkColor/palette.link and paints links dark blue, which is
-  // unreadable on the dark bubble. Rewrite links (outside code) as inline HTML anchors with an
-  // explicit colour; Qt's Markdown importer keeps inline HTML.
-  function colorLinks(markdown) {
-    var c = String(linkColor)
-    function anchor(url, label) {
-      return "<a href=\"" + url.replace(/"/g, "%22") + "\"><span style=\"color:" + c + "\">" + label + "</span></a>"
-    }
-    function prose(s) {
-      var parts = s.split(/(`[^`\n]*`)/)
-      for (var i = 0; i < parts.length; i += 2) {
-        parts[i] = parts[i]
-          .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, function(m, label, url) { return anchor(url, label) })
-          .replace(/<(https?:\/\/[^>\s]+)>/g, function(m, url) { return anchor(url, url) })
-          .replace(/(^|[\s(])(https?:\/\/[^\s<>()\]"]+[^\s<>()\]".,;:!?])/g, function(m, pre, url) { return pre + anchor(url, url) })
-      }
-      return parts.join("")
-    }
-    var blocks = String(markdown || "").split(/(```[\s\S]*?```)/)
-    for (var i = 0; i < blocks.length; i += 2) blocks[i] = prose(blocks[i])
-    return blocks.join("")
-  }
 
   function addMedia(profile, remote, local, error) {
     var list = (transcripts[profile] || []).slice()
@@ -363,6 +395,7 @@ Panel {
   function openFile(local) { return Qt.openUrlExternally("file://" + local) }
 
   function pushMessage(profile, role, text, images, files) {
+    flushStream()
     var list = (transcripts[profile] || []).slice()
     var row = { role: role, text: text }
     if (images && images.length > 0) row.images = images
@@ -381,6 +414,20 @@ Panel {
     revision++
   }
 
+  // Streamed text is shown at most every 50 ms. Tokens arrive faster than that, and each one shown
+  // costs a layout of the reply's last block.
+  property var streamPending: ({})
+  Timer { id: streamTimer; interval: 50; onTriggered: if (root.flushStream()) restart() }
+  function flushStream() {
+    var pending = streamPending, shown = false
+    streamPending = ({})
+    for (var profile in pending) {
+      appendToLast(profile, pending[profile])
+      shown = true
+    }
+    return shown
+  }
+
   function setBusy(profile, value) {
     busyProfiles[profile] = value
     revision++
@@ -393,6 +440,8 @@ Panel {
   function handleEvent(line) {
     var ev
     try { ev = JSON.parse(line) } catch (e) { return }
+    // Whatever this is, it comes after the text already received.
+    if (ev.ev !== "delta") flushStream()
     switch (ev.ev) {
     case "ready":
       loadedProfiles = ({})
@@ -406,11 +455,13 @@ Panel {
       connected = true
       lastError = ""
       profiles = ev.profiles || []
+      sectionOrder = ev.sections ? ev.sections.order : []
+      sectionByBot = ev.sections ? ev.sections.assign : ({})
       var names = profiles.map(function(p) { return p.name })
       for (var known in transcripts) if (names.indexOf(known) < 0 && known !== "default") forgetBot(known)
       if (names.indexOf(selected) < 0) selected = "default"
-      statusLine = ev.url.replace(/^https?:\/\//, "") + " · v" + ev.version
-        + (ev.gatewayRunning ? " · gateway on" : " · gateway off")
+      serverHost = ev.url.replace(/^https?:\/\//, "")
+      statusLine = "v" + ev.version + (ev.gatewayRunning ? "" : " · gateway off")
       break
     case "session":
       sessionOwner[ev.session] = ev.profile
@@ -694,7 +745,11 @@ Panel {
       break
     case "delta":
       var writer = profileForSession(ev.session)
-      appendToLast(writer, ev.text)
+      streamPending[writer] = (streamPending[writer] || "") + ev.text
+      if (!streamTimer.running) {
+        flushStream()
+        streamTimer.start()
+      }
       if (busyProfiles[writer] && (!activityByProfile[writer] || activityByProfile[writer].text !== "writing"))
         setActivity(writer, "writing")
       break
@@ -842,12 +897,24 @@ Panel {
     return true
   }
 
+  // History, Routines, Groups, Edit, the model list and the new-bot form share the space above the
+  // chat. Only one is open at a time, so the conversation is never pushed out of view.
+  function closeDrawers(keep) {
+    if (keep !== "sessions") showingSessions = false
+    if (keep !== "routines") showingRoutines = false
+    if (keep !== "groups" && showingGroups) toggleGroups()
+    if (keep !== "edit") editing = false
+    if (keep !== "model") pickingModel = false
+    if (keep !== "create") creating = false
+  }
+
   function toggleSessions() {
-    showingSessions = !showingSessions
-    if (showingSessions) refreshSessions()
+    if (showingSessions) showingSessions = false
+    else refreshSessions()
   }
 
   function refreshSessions() {
+    if (!showingSessions) closeDrawers("sessions")
     showingSessions = true
     sessionList = []
     sendCommand({ cmd: "sessions", profile: selected })
@@ -860,11 +927,13 @@ Panel {
   }
 
   function toggleRoutines() {
+    if (!showingRoutines) closeDrawers("routines")
     showingRoutines = !showingRoutines
     if (showingRoutines) refreshRoutines()
   }
 
   function toggleGroups() {
+    if (!showingGroups) closeDrawers("groups")
     showingGroups = !showingGroups
     roomError = ""
     if (showingGroups) {
@@ -1069,6 +1138,7 @@ Panel {
   }
 
   function toggleEdit() {
+    if (!editing) closeDrawers("edit")
     editing = !editing
     if (editing) {
       var info = profileInfo[selected]
@@ -1076,6 +1146,11 @@ Panel {
       soulArea.text = info ? info.soul : ""
       refreshProfile()
     }
+  }
+
+  function toggleModelPicker() {
+    if (!pickingModel) closeDrawers("model")
+    pickingModel = !pickingModel
   }
 
   function refreshProfile() { sendCommand({ cmd: "profile.get", profile: selected }) }
@@ -1277,7 +1352,7 @@ Panel {
       return "deleting"
     }
     function armDelete(name: string): string { root.requestDelete(name); return root.armedDelete }
-    function toggleModelPicker(): string { root.pickingModel = !root.pickingModel; return String(root.pickingModel) }
+    function toggleModelPicker(): string { root.toggleModelPicker(); return String(root.pickingModel) }
     function steer(text: string): string { return root.steerText(text, "steer") ? (root.busy ? "steering" : "sent") : "empty" }
     function queue(text: string): string { return root.steerText(text, "queue") ? (root.busy ? "queueing" : "sent") : "empty" }
     function stop(): string { root.sendCommand({ cmd: "interrupt", profile: root.selected }); return "interrupting" }
@@ -1426,6 +1501,11 @@ Panel {
     function profileDuplicate(newName: string): string { return root.duplicateProfile(newName) ? "duplicating" : "invalid" }
     function pin(value: bool): string { root.setProfileFlag("pinned", value); return value ? "pinning" : "unpinning" }
     function hide(value: bool): string { root.setProfileFlag("hidden", value); return value ? "hiding" : "unhiding" }
+    function section(name: string): string { root.setSection(name); return name.trim() === "" ? "unassigning" : "moving" }
+    function sections(): string {
+      return JSON.stringify({ order: root.sectionOrder, groups: root.rosterGroups.map(function(g) {
+        return { name: g.name, bots: g.bots.map(function(b) { return b.name }) } }) })
+    }
     function showHidden(value: bool): string { root.showHidden = value; return String(root.showHidden) }
     // Opens the Edit section the same way its button does; used for captures.
     function editView(): string { if (!root.editing) root.toggleEdit(); return "shown" }
@@ -1662,52 +1742,91 @@ Panel {
               color: root.connected ? root.dim : root.urgent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+              ToolTip.visible: statusHover.containsMouse && root.serverHost !== ""
+              ToolTip.text: root.serverHost
+
+              MouseArea {
+                id: statusHover
+                anchors.fill: parent
+                hoverEnabled: true
+              }
             }
           }
         }
 
-        Flow {
+        Column {
           width: parent.width
-          spacing: Style.spacing.sm
+          spacing: Style.space(6)
 
           Repeater {
-            model: root.rosterProfiles
-            Button {
+            model: root.rosterGroups
+
+            Column {
+              id: rosterGroup
               required property var modelData
-              // root.revision: the status maps are mutated in place, so re-evaluate on every revision bump.
-              text: (root.revision, (modelData.pinned ? "📌 " : "") + modelData.name) + (root.waitingOnUser && root.waitingProfile === modelData.name ? " ?"
-                : root.busyProfiles[modelData.name] ? " …" : root.cronRunning[modelData.name] ? " ⏱"
-                : root.unreadProfiles[modelData.name] ? " •" : "")
-              selected: modelData.name === root.selected
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              onClicked: root.selected = modelData.name
-            }
-          }
+              required property int index
+              readonly property bool last: index === root.rosterGroups.length - 1
+              width: parent.width
+              spacing: Style.space(4)
 
-          Button {
-            text: root.creating ? "× cancel" : "+ new bot"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            onClicked: {
-              root.creating = !root.creating
-              if (root.creating) Qt.callLater(function() { nameField.forceActiveFocus() })
-            }
-          }
+              Text {
+                visible: rosterGroup.modelData.name !== ""
+                text: rosterGroup.modelData.name
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.capitalization: Font.AllUppercase
+              }
 
-          Button {
-            visible: root.hiddenCount > 0
-            text: root.showHidden ? "Hide hidden" : "Show hidden (" + root.hiddenCount + ")"
-            bordered: true
-            selected: root.showHidden
-            foreground: root.dim
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            onClicked: root.showHidden = !root.showHidden
+              Flow {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                  Repeater {
+                    model: rosterGroup.modelData.bots
+                    Button {
+                      required property var modelData
+                      // root.revision: the status maps are mutated in place, so re-evaluate on every revision bump.
+                      text: (root.revision, (modelData.pinned ? "󰐃 " : "") + modelData.name) + (root.waitingOnUser && root.waitingProfile === modelData.name ? " ?"
+                        : root.busyProfiles[modelData.name] ? " …" : root.cronRunning[modelData.name] ? " ⏱"
+                        : root.unreadProfiles[modelData.name] ? " •" : "")
+                      selected: modelData.name === root.selected
+                      bordered: true
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.bodySmall
+                      onClicked: root.selected = modelData.name
+                    }
+                  }
+
+                  // The roster's own buttons close the last row.
+                  Button {
+                    visible: rosterGroup.last
+                    text: root.creating ? "× cancel" : "+ new bot"
+                    bordered: true
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    onClicked: {
+                      if (!root.creating) root.closeDrawers("create")
+                      root.creating = !root.creating
+                      if (root.creating) Qt.callLater(function() { nameField.forceActiveFocus() })
+                    }
+                  }
+
+                  Button {
+                    visible: rosterGroup.last && root.hiddenCount > 0
+                    text: root.showHidden ? "Hide hidden" : "Show hidden (" + root.hiddenCount + ")"
+                    bordered: true
+                    selected: root.showHidden
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    onClicked: root.showHidden = !root.showHidden
+                  }
+              }
+            }
           }
         }
 
@@ -1755,17 +1874,6 @@ Panel {
               onClicked: root.toggleSearch()
             }
 
-            TextField {
-              id: searchField
-              visible: root.searching
-              width: Style.space(170)
-              placeholderText: "search this chat"
-              foreground: root.foreground
-              text: root.searchText
-              onTextChanged: root.searchText = text
-              Keys.onEscapePressed: { text = ""; root.searching = false; input.forceActiveFocus() }
-            }
-
             Button {
               text: "Routines"
               bordered: true
@@ -1805,16 +1913,18 @@ Panel {
               fontSize: Style.font.caption
               onClicked: root.openScreen()
             }
+          }
 
-            Button {
-              visible: root.selected !== "default"
-              text: root.armedDelete === root.selected ? "Click again to delete @" + root.selected : "Delete @" + root.selected
-              bordered: true
-              foreground: root.armedDelete === root.selected ? root.urgent : root.dim
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.requestDelete(root.selected)
-            }
+          // Search filters the chat below; its field gets a row of its own so the buttons never reflow.
+          TextField {
+            id: searchField
+            visible: root.searching
+            width: parent.width
+            placeholderText: "search this chat (Esc closes)"
+            foreground: root.foreground
+            text: root.searchText
+            onTextChanged: root.searchText = text
+            Keys.onEscapePressed: { text = ""; root.searching = false; input.forceActiveFocus() }
           }
         }
 
@@ -1923,852 +2033,1106 @@ Panel {
           }
         }
 
-        Column {
-          visible: root.showingSessions
+        // The drawers (History, Groups, Routines, Edit, Model, New bot) scroll inside a capped area,
+        // so a tall drawer never covers the chat or the composer.
+        Flickable {
+          id: drawerFlick
+          // Bound to the drawer flags, not to drawerColumn's height: a hidden Column is never laid out,
+          // so its implicitHeight would stay 0 and the drawer would never appear.
+          visible: root.showingSessions || root.showingGroups || root.showingRoutines || root.editing
+            || root.pickingModel || root.creating
           width: parent.width
-          spacing: Style.space(2)
+          height: Math.min(drawerColumn.implicitHeight, Math.max(Style.space(110),
+            keyCatcher.height - footer.height - y - (root.drawerTakesOver ? Style.space(8) : Style.space(130))))
+          contentWidth: width
+          contentHeight: drawerColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-          Text {
-            visible: root.sessionList.length === 0
-            text: "Loading conversations…"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
+          Column {
+            id: drawerColumn
+            width: drawerFlick.width
+            spacing: header.spacing
 
-          Repeater {
-            model: root.sessionList.slice(0, 10)
-            Item {
-              id: sessionRow
-              required property var modelData
-              readonly property bool renaming: root.renamingSession === modelData.id
-              width: parent.width
-              implicitHeight: sessionTop.height + sessionActions.height + Style.space(10)
-
-              Rectangle {
-                anchors.fill: parent
-                radius: Style.cornerRadius
-                color: modelData.current ? root.alpha(root.foreground, 0.14) : "transparent"
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                enabled: !sessionRow.renaming
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.openSession(modelData.id)
-              }
-
-              Item {
-                id: sessionTop
-                x: Style.space(8)
-                y: Style.space(4)
-                width: parent.width - Style.space(16)
-                height: sessionRow.renaming ? renameField.implicitHeight : sessionMeta.implicitHeight
-
-                Text {
-                  id: sessionMeta
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: Qt.formatDateTime(new Date(modelData.startedAt * 1000), "MM-dd HH:mm")
-                    + " · " + modelData.messages + " msgs"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Text {
-                  visible: !sessionRow.renaming
-                  anchors.left: parent.left
-                  anchors.right: sessionMeta.left
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: (modelData.source === "cron" ? "⏱ " : "") + modelData.title
-                  elide: Text.ElideRight
-                  wrapMode: Text.NoWrap
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                TextField {
-                  id: renameField
-                  visible: sessionRow.renaming
-                  anchors.left: parent.left
-                  anchors.right: sessionMeta.left
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  placeholderText: "title"
-                  foreground: root.foreground
-                  onVisibleChanged: if (visible) { text = modelData.title; forceActiveFocus() }
-                  onAccepted: root.sessionRename(modelData.id, text)
-                  Keys.onEscapePressed: root.renamingSession = ""
-                }
-              }
-
-              Flow {
-                id: sessionActions
-                anchors.top: sessionTop.bottom
-                anchors.topMargin: Style.space(2)
-                x: Style.space(8)
-                width: parent.width - Style.space(16)
-                layoutDirection: Qt.RightToLeft
-                spacing: Style.spacing.sm
-
-                Button {
-                  text: root.armedSessionDelete === modelData.id ? "Click again to delete" : "Delete"
-                  foreground: root.armedSessionDelete === modelData.id ? root.urgent : root.dim
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onClicked: root.requestSessionDelete(modelData.id)
-                }
-                Button {
-                  text: "Archive"
-                  foreground: root.dim
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onClicked: root.sessionArchive(modelData.id)
-                }
-                Button {
-                  text: sessionRow.renaming ? "Save" : "Rename"
-                  foreground: root.dim
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onClicked: sessionRow.renaming ? root.sessionRename(modelData.id, renameField.text)
-                    : root.renamingSession = modelData.id
-                }
-              }
-            }
-          }
-        }
-
-        // Group chats: the room list and a New group form, or the open room with its own composer.
-        Column {
-          visible: root.showingGroups
-          width: parent.width
-          spacing: Style.space(4)
-
-          Text {
-            visible: root.roomError !== ""
-            width: parent.width
-            wrapMode: Text.Wrap
-            text: "⚠ " + root.roomError
-            color: root.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Text {
-            visible: root.openRoom === "" && root.groupRooms.length === 0
-            text: "No group chats yet."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Repeater {
-            model: root.openRoom === "" ? root.groupRooms : []
-            Item {
-              required property var modelData
-              width: parent.width
-              implicitHeight: roomLine.implicitHeight + Style.space(8)
-
-              Rectangle {
-                anchors.fill: parent
-                radius: Style.cornerRadius
-                color: roomMouse.containsMouse ? root.alpha(root.foreground, 0.1) : "transparent"
-              }
-
-              MouseArea {
-                id: roomMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.openGroup(modelData.id)
-              }
-
-              Text {
-                id: roomLine
-                x: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                width: parent.width - Style.space(16)
-                elide: Text.ElideRight
-                text: (root.groupUnread[modelData.id] ? "• " : "") + "👥 " + modelData.name + "  ·  "
-                  + modelData.members.map(function(m) { return "@" + m }).join(" ")
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-
-          Text {
-            visible: root.openRoom === ""
-            text: "New group: pick 2 to 6 bots"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Flow {
-            visible: root.openRoom === ""
-            width: parent.width
-            spacing: Style.spacing.sm
-
-            Repeater {
-              model: root.rosterProfiles
-              Button {
-                required property var modelData
-                text: "@" + modelData.name
-                bordered: true
-                selected: root.newGroupMembers[modelData.name] === true
-                foreground: root.dim
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                onClicked: root.toggleGroupMember(modelData.name)
-              }
-            }
-          }
-
-          Item {
-            visible: root.openRoom === ""
-            width: parent.width
-            implicitHeight: Math.max(groupNameField.implicitHeight, createGroupButton.implicitHeight)
-
-            TextField {
-              id: groupNameField
-              anchors.left: parent.left
-              anchors.right: createGroupButton.left
-              anchors.rightMargin: Style.spacing.sm
-              anchors.verticalCenter: parent.verticalCenter
-              placeholderText: "group name"
-              foreground: root.foreground
-              onAccepted: if (root.createGroup(text)) text = ""
-            }
-
-            Button {
-              id: createGroupButton
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Create group"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: if (root.createGroup(groupNameField.text)) groupNameField.text = ""
-            }
-          }
-
-          Item {
-            visible: root.openRoom !== ""
-            width: parent.width
-            implicitHeight: roomHeaderButtons.implicitHeight
-
-            Text {
-              anchors.left: parent.left
-              anchors.right: roomHeaderButtons.left
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              elide: Text.ElideRight
-              text: "👥 " + (root.openRoomInfo ? root.openRoomInfo.name + "  ·  "
-                + root.openRoomInfo.members.map(function(m) { return "@" + m }).join(" ") : root.openRoom)
-              color: root.foreground
-              font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            }
-
-            Row {
-              id: roomHeaderButtons
-              anchors.right: parent.right
-              spacing: Style.spacing.sm
-
-              Button {
-                visible: root.roomWorking
-                text: "Stop"
-                bordered: true
-                foreground: root.urgent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                onClicked: root.sendCommand({ cmd: "group.stop", room: root.openRoom })
-              }
-
-              Button {
-                text: "Rename"
-                bordered: true
-                selected: root.renamingRoom
-                foreground: root.dim
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                onClicked: root.renamingRoom = !root.renamingRoom
-              }
-
-              Button {
-                text: root.armedDisband === root.openRoom ? "Click again to delete group" : "Delete group"
-                bordered: true
-                foreground: root.armedDisband === root.openRoom ? root.urgent : root.dim
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                onClicked: root.requestDisband()
-              }
-
-              Button {
-                text: "‹ Groups"
-                bordered: true
-                foreground: root.dim
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                onClicked: root.closeRoom()
-              }
-            }
-          }
-
-          TextField {
-            id: roomRenameField
-            visible: root.openRoom !== "" && root.renamingRoom
-            width: parent.width
-            placeholderText: "new group name (Enter to save, Esc to cancel)"
-            foreground: root.foreground
-            onVisibleChanged: if (visible) { text = root.openRoomInfo ? root.openRoomInfo.name : ""; forceActiveFocus() }
-            onAccepted: root.renameRoom(text)
-            Keys.onEscapePressed: root.renamingRoom = false
-          }
-
-          Rectangle {
-            visible: root.openRoom !== ""
-            width: parent.width
-            height: Style.space(210)
-            radius: Style.cornerRadius
-            color: root.alpha(root.foreground, 0.04)
-
-            ListView {
-              id: roomView
-              anchors.fill: parent
-              anchors.margins: Style.space(6)
-              clip: true
-              spacing: Style.space(6)
-              model: root.roomRows
-              onCountChanged: Qt.callLater(function() { roomView.positionViewAtEnd() })
-
-              // Click a message to reply in its thread; links inside the text still open.
-              delegate: Item {
-                required property var modelData
-                width: roomView.width
-                implicitHeight: rowColumn.implicitHeight
-
-                Rectangle {
-                  anchors.fill: parent
-                  anchors.margins: -Style.space(2)
-                  radius: Style.cornerRadius
-                  color: root.roomReply && modelData.thread && root.roomReply.thread === modelData.thread
-                    ? root.alpha(Color.accent, 0.12) : "transparent"
-                }
-
-                MouseArea {
-                  anchors.fill: parent
-                  enabled: modelData.role !== "status" && !!modelData.thread
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.replyInRoom(modelData)
-                }
-
-                Column {
-                id: rowColumn
-                width: parent.width
-                spacing: Style.space(1)
-
-                Text {
-                  visible: modelData.role !== "status"
-                  text: modelData.role === "you" ? "you" : "@" + modelData.who
-                  color: modelData.role === "you" ? root.dim : root.linkColor
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-
-                Text {
-                  width: parent.width
-                  wrapMode: Text.Wrap
-                  text: modelData.role === "bot" ? root.colorLinks(root.displayText(modelData.text))
-                    : modelData.role === "status" ? (modelData.who ? "@" + modelData.who + " " : "") + modelData.text
-                    : modelData.text
-                  textFormat: modelData.role === "bot" ? Text.MarkdownText : Text.PlainText
-                  color: modelData.role === "status" ? root.dim : root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: modelData.role === "status" ? Style.font.caption : Style.font.bodySmall
-                  onLinkActivated: function(link) { Qt.openUrlExternally(link) }
-                }
-                }
-              }
-            }
-
-            Text {
-              anchors.centerIn: parent
-              visible: root.roomRows.length === 0
-              text: "No messages yet. @mention a bot, or write to everyone."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          Text {
-            visible: root.openRoom !== "" && root.roomWorking
-            text: "… bots are replying"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Repeater {
-            model: root.openRoom !== "" ? root.roomActions : []
-            Rectangle {
-              id: actionCard
-              required property var modelData
-              readonly property var action: modelData
-              width: parent.width
-              implicitHeight: actionColumn.implicitHeight + Style.space(12)
-              radius: Style.cornerRadius
-              color: root.alpha(root.urgent, 0.10)
-              border.width: 1
-              border.color: root.alpha(root.urgent, 0.4)
-
-              Column {
-                id: actionColumn
-                x: Style.space(6)
-                y: Style.space(6)
-                width: parent.width - Style.space(12)
-                spacing: Style.space(4)
-
-                Text {
-                  width: parent.width
-                  wrapMode: Text.Wrap
-                  text: actionCard.action.kind === "approval"
-                    ? "@" + actionCard.action.member + " needs approval: " + (actionCard.action.description || actionCard.action.command)
-                    : "A turn ended without a clear result and waits for a retry."
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Text {
-                  visible: actionCard.action.kind === "approval" && actionCard.action.description !== "" && actionCard.action.command !== ""
-                  width: parent.width
-                  wrapMode: Text.Wrap
-                  text: actionCard.action.command || ""
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Row {
-                  spacing: Style.spacing.sm
-
-                  Repeater {
-                    model: actionCard.action.kind === "approval" ? actionCard.action.choices : ["retry"]
-                    Button {
-                      required property var modelData
-                      text: modelData === "once" ? "Approve once" : modelData === "deny" ? "Deny" : modelData === "retry" ? "Retry" : modelData
-                      bordered: true
-                      foreground: modelData === "deny" ? root.urgent : root.foreground
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      onClicked: modelData === "retry" ? root.retryRoomTask(actionCard.action.taskId)
-                        : root.answerRoomApproval(actionCard.action, modelData)
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          Item {
-            visible: root.openRoom !== "" && root.roomReply !== null
-            width: parent.width
-            implicitHeight: replyLine.implicitHeight
-
-            Text {
-              id: replyLine
-              anchors.left: parent.left
-              anchors.right: replyCancel.left
-              anchors.rightMargin: Style.space(8)
-              elide: Text.ElideRight
-              text: root.roomReply ? "↩ in thread" + (root.roomReply.who ? " with @" + root.roomReply.who : "") + ": "
-                + root.roomReply.text.replace(/\s+/g, " ") : ""
-              color: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              id: replyCancel
-              anchors.right: parent.right
-              anchors.verticalCenter: replyLine.verticalCenter
-              text: "×"
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.roomReply = null
-              }
-            }
-          }
-
-          TextField {
-            id: roomInput
-            visible: root.openRoom !== ""
-            width: parent.width
-            placeholderText: root.roomReply ? "Reply in this thread" : "Message the group  (@bot to address one)"
-            foreground: root.foreground
-            onAccepted: if (root.sendToRoom(text)) text = ""
-          }
-        }
-
-        Column {
-          visible: root.showingRoutines
-          width: parent.width
-          spacing: Style.space(2)
-
-          Text {
-            visible: root.routines.length === 0
-            text: root.routinesLoaded ? "No routines for @" + root.selected : "Loading routines…"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Repeater {
-            model: root.routines
             Column {
-              id: routineRow
-              required property var modelData
-              readonly property var runs: { root.revision; return root.routineRunsById[modelData.id] || null }
+              visible: root.showingSessions
               width: parent.width
               spacing: Style.space(2)
 
-              Item {
-                width: parent.width
-                implicitHeight: routineButtons.implicitHeight + Style.space(4)
-
-                Text {
-                  anchors.left: parent.left
-                  anchors.leftMargin: Style.space(8)
-                  anchors.right: routineButtons.left
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: routineRow.modelData.name + " · " + routineRow.modelData.schedule_display
-                    + " · next " + (routineRow.modelData.paused ? "paused" : root.formatWhen(routineRow.modelData.next_run_at))
-                    + " · last " + (routineRow.modelData.last_status || "—")
-                  elide: Text.ElideRight
-                  wrapMode: Text.NoWrap
-                  color: routineRow.modelData.last_status && routineRow.modelData.last_status !== "ok" ? root.urgent
-                    : routineRow.modelData.paused ? root.dim : root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Row {
-                  id: routineButtons
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(4)
-
-                  Button {
-                    text: "Runs"
-                    bordered: true
-                    selected: root.routineRunsShown === routineRow.modelData.id
-                    foreground: root.dim
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.toggleRoutineRuns(routineRow.modelData.id)
-                  }
-                  Button {
-                    text: "Run"
-                    bordered: true
-                    foreground: root.dim
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.routineCommand("run", routineRow.modelData.id)
-                  }
-                  Button {
-                    text: routineRow.modelData.paused ? "Resume" : "Pause"
-                    bordered: true
-                    foreground: root.dim
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.routineCommand(routineRow.modelData.paused ? "resume" : "pause", routineRow.modelData.id)
-                  }
-                  Button {
-                    text: root.armedRoutine === routineRow.modelData.id ? "Confirm" : "Delete"
-                    bordered: true
-                    foreground: root.armedRoutine === routineRow.modelData.id ? root.urgent : root.dim
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.requestRoutineDelete(routineRow.modelData.id)
-                  }
-                }
+              PanelSectionHeader {
+                text: "HISTORY · @" + root.selected
+                foreground: root.foreground
+                fontFamily: root.fontFamily
               }
 
               Text {
-                visible: root.routineRunsShown === routineRow.modelData.id && (routineRow.runs === null || routineRow.runs.length === 0)
-                leftPadding: Style.space(20)
-                text: routineRow.runs === null ? "Loading runs…" : "No runs yet"
+                visible: root.sessionList.length === 0
+                text: "Loading conversations…"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
 
               Repeater {
-                model: root.routineRunsShown === routineRow.modelData.id && routineRow.runs ? routineRow.runs : []
-                Text {
+                model: root.sessionList.slice(0, 10)
+                Item {
+                  id: sessionRow
                   required property var modelData
-                  width: routineRow.width
-                  leftPadding: Style.space(20)
-                  rightPadding: Style.space(8)
-                  text: root.formatWhen(modelData.started_at) + (modelData.end_reason ? " · " + modelData.end_reason : "")
-                    + (modelData.title ? " · " + modelData.title : "")
+                  readonly property bool renaming: root.renamingSession === modelData.id
+                  width: parent.width
+                  implicitHeight: sessionTop.height + sessionActions.height + Style.space(10)
+
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: Style.cornerRadius
+                    color: modelData.current ? root.alpha(root.foreground, 0.14) : "transparent"
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    enabled: !sessionRow.renaming
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openSession(modelData.id)
+                  }
+
+                  Item {
+                    id: sessionTop
+                    x: Style.space(8)
+                    y: Style.space(4)
+                    width: parent.width - Style.space(16)
+                    height: sessionRow.renaming ? renameField.implicitHeight : sessionMeta.implicitHeight
+
+                    Text {
+                      id: sessionMeta
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: Qt.formatDateTime(new Date(modelData.startedAt * 1000), "MM-dd HH:mm")
+                        + " · " + modelData.messages + " msgs"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Text {
+                      visible: !sessionRow.renaming
+                      anchors.left: parent.left
+                      anchors.right: sessionMeta.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: (modelData.source === "cron" ? "⏱ " : "") + modelData.title
+                      elide: Text.ElideRight
+                      wrapMode: Text.NoWrap
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    TextField {
+                      id: renameField
+                      visible: sessionRow.renaming
+                      anchors.left: parent.left
+                      anchors.right: sessionMeta.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      placeholderText: "title"
+                      foreground: root.foreground
+                      onVisibleChanged: if (visible) { text = modelData.title; forceActiveFocus() }
+                      onAccepted: root.sessionRename(modelData.id, text)
+                      Keys.onEscapePressed: root.renamingSession = ""
+                    }
+                  }
+
+                  Flow {
+                    id: sessionActions
+                    anchors.top: sessionTop.bottom
+                    anchors.topMargin: Style.space(2)
+                    x: Style.space(8)
+                    width: parent.width - Style.space(16)
+                    layoutDirection: Qt.RightToLeft
+                    spacing: Style.spacing.sm
+
+                    Button {
+                      text: root.armedSessionDelete === modelData.id ? "Click again to delete" : "Delete"
+                      foreground: root.armedSessionDelete === modelData.id ? root.urgent : root.dim
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: root.requestSessionDelete(modelData.id)
+                    }
+                    Button {
+                      text: "Archive"
+                      foreground: root.dim
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: root.sessionArchive(modelData.id)
+                    }
+                    Button {
+                      text: sessionRow.renaming ? "Save" : "Rename"
+                      foreground: root.dim
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: sessionRow.renaming ? root.sessionRename(modelData.id, renameField.text)
+                        : root.renamingSession = modelData.id
+                    }
+                  }
+                }
+              }
+            }
+
+            // Group chats: the room list and a New group form, or the open room with its own composer.
+            Column {
+              visible: root.showingGroups
+              width: parent.width
+              spacing: Style.space(4)
+
+              PanelSectionHeader {
+                text: "GROUP CHATS"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                visible: root.roomError !== ""
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: "⚠ " + root.roomError
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                visible: root.openRoom === "" && root.groupRooms.length === 0
+                text: "No group chats yet."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Repeater {
+                model: root.openRoom === "" ? root.groupRooms : []
+                Item {
+                  required property var modelData
+                  width: parent.width
+                  implicitHeight: roomLine.implicitHeight + Style.space(8)
+
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: Style.cornerRadius
+                    color: roomMouse.containsMouse ? root.alpha(root.foreground, 0.1) : "transparent"
+                  }
+
+                  MouseArea {
+                    id: roomMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openGroup(modelData.id)
+                  }
+
+                  Text {
+                    id: roomLine
+                    x: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - Style.space(16)
+                    elide: Text.ElideRight
+                    text: (root.groupUnread[modelData.id] ? "• " : "") + "󰡉 " + modelData.name + "  ·  "
+                      + modelData.members.map(function(m) { return "@" + m }).join(" ")
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              Text {
+                visible: root.openRoom === ""
+                text: "New group: pick 2 to 6 bots"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Flow {
+                visible: root.openRoom === ""
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Repeater {
+                  model: root.rosterProfiles
+                  Button {
+                    required property var modelData
+                    text: "@" + modelData.name
+                    bordered: true
+                    selected: root.newGroupMembers[modelData.name] === true
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.toggleGroupMember(modelData.name)
+                  }
+                }
+              }
+
+              Item {
+                visible: root.openRoom === ""
+                width: parent.width
+                implicitHeight: Math.max(groupNameField.implicitHeight, createGroupButton.implicitHeight)
+
+                TextField {
+                  id: groupNameField
+                  anchors.left: parent.left
+                  anchors.right: createGroupButton.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "group name"
+                  foreground: root.foreground
+                  onAccepted: if (root.createGroup(text)) text = ""
+                }
+
+                Button {
+                  id: createGroupButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  height: groupNameField.height
+                  text: "Create group"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: if (root.createGroup(groupNameField.text)) groupNameField.text = ""
+                }
+              }
+
+              Item {
+                visible: root.openRoom !== ""
+                width: parent.width
+                implicitHeight: roomHeaderButtons.implicitHeight
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.right: roomHeaderButtons.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
                   elide: Text.ElideRight
-                  wrapMode: Text.NoWrap
+                  text: "󰡉 " + (root.openRoomInfo ? root.openRoomInfo.name + "  ·  "
+                    + root.openRoomInfo.members.map(function(m) { return "@" + m }).join(" ") : root.openRoom)
+                  color: root.foreground
+                  font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                }
+
+                Row {
+                  id: roomHeaderButtons
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    visible: root.roomWorking
+                    text: "Stop"
+                    bordered: true
+                    foreground: root.urgent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.sendCommand({ cmd: "group.stop", room: root.openRoom })
+                  }
+
+                  Button {
+                    text: "Rename"
+                    bordered: true
+                    selected: root.renamingRoom
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.renamingRoom = !root.renamingRoom
+                  }
+
+                  Button {
+                    text: root.armedDisband === root.openRoom ? "Click again to delete group" : "Delete group"
+                    bordered: true
+                    foreground: root.armedDisband === root.openRoom ? root.urgent : root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.requestDisband()
+                  }
+
+                  Button {
+                    text: "‹ Groups"
+                    bordered: true
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.closeRoom()
+                  }
+                }
+              }
+
+              TextField {
+                id: roomRenameField
+                visible: root.openRoom !== "" && root.renamingRoom
+                width: parent.width
+                placeholderText: "new group name (Enter to save, Esc to cancel)"
+                foreground: root.foreground
+                onVisibleChanged: if (visible) { text = root.openRoomInfo ? root.openRoomInfo.name : ""; forceActiveFocus() }
+                onAccepted: root.renameRoom(text)
+                Keys.onEscapePressed: root.renamingRoom = false
+              }
+
+              Rectangle {
+                visible: root.openRoom !== ""
+                width: parent.width
+                // Fills the space the hidden chat leaves; the header row, cards and input take the rest.
+                height: Math.max(Style.space(150), keyCatcher.height - footer.height - drawerFlick.y - Style.space(150))
+                radius: Style.cornerRadius
+                color: root.alpha(root.foreground, 0.04)
+
+                ListView {
+                  id: roomView
+                  anchors.fill: parent
+                  anchors.margins: Style.space(6)
+                  clip: true
+                  spacing: Style.space(6)
+                  model: root.roomRows
+                  onCountChanged: Qt.callLater(function() { roomView.positionViewAtEnd() })
+
+                  // Click a message to reply in its thread; links inside the text still open.
+                  delegate: Item {
+                    required property var modelData
+                    width: roomView.width
+                    implicitHeight: rowColumn.implicitHeight
+
+                    Rectangle {
+                      anchors.fill: parent
+                      anchors.margins: -Style.space(2)
+                      radius: Style.cornerRadius
+                      color: root.roomReply && modelData.thread && root.roomReply.thread === modelData.thread
+                        ? root.alpha(Color.accent, 0.12) : "transparent"
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      enabled: modelData.role !== "status" && !!modelData.thread
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.replyInRoom(modelData)
+                    }
+
+                    Column {
+                    id: rowColumn
+                    width: parent.width
+                    spacing: Style.space(1)
+
+                    Text {
+                      visible: modelData.role !== "status"
+                      text: modelData.role === "you" ? "you" : "@" + modelData.who
+                      color: modelData.role === "you" ? root.dim : root.linkColor
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      visible: modelData.role !== "bot"
+                      width: parent.width
+                      wrapMode: Text.Wrap
+                      text: modelData.role === "status" ? (modelData.who ? "@" + modelData.who + " " : "") + modelData.text
+                        : modelData.text
+                      textFormat: Text.PlainText
+                      color: modelData.role === "status" ? root.dim : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: modelData.role === "status" ? Style.font.caption : Style.font.bodySmall
+                    }
+
+                    MarkdownBody {
+                      visible: modelData.role === "bot"
+                      width: parent.width
+                      markdown: modelData.role === "bot" ? root.displayText(modelData.text) : ""
+                      color: root.foreground
+                      linkColor: root.linkColor
+                      codeBackground: root.alpha(root.foreground, 0.10)
+                      fontFamily: root.fontFamily
+                      pixelSize: Style.font.bodySmall
+                      radius: Style.cornerRadius
+                    }
+                    }
+                  }
+                }
+
+                Text {
+                  anchors.centerIn: parent
+                  visible: root.roomRows.length === 0
+                  text: "No messages yet. @mention a bot, or write to everyone."
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
               }
-            }
-          }
 
-          Row {
-            width: parent.width
-            spacing: Style.spacing.sm
+              Text {
+                visible: root.openRoom !== "" && root.roomWorking
+                text: "… bots are replying"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
 
-            TextField {
-              id: routineNameField
-              width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.25
-              placeholderText: "name"
-              foreground: root.foreground
-              onAccepted: routineScheduleField.forceActiveFocus()
-            }
-            TextField {
-              id: routineScheduleField
-              width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.25
-              placeholderText: "every 1h"
-              foreground: root.foreground
-              onAccepted: routinePromptField.forceActiveFocus()
-            }
-            TextField {
-              id: routinePromptField
-              width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.5
-              placeholderText: "prompt"
-              foreground: root.foreground
-              onAccepted: root.createRoutine(routineNameField.text, routineScheduleField.text, text)
-            }
-            Button {
-              id: routineCreateButton
-              text: "Create"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.createRoutine(routineNameField.text, routineScheduleField.text, routinePromptField.text)
-            }
-          }
-        }
+              Repeater {
+                model: root.openRoom !== "" ? root.roomActions : []
+                Rectangle {
+                  id: actionCard
+                  required property var modelData
+                  readonly property var action: modelData
+                  width: parent.width
+                  implicitHeight: actionColumn.implicitHeight + Style.space(12)
+                  radius: Style.cornerRadius
+                  color: root.alpha(root.urgent, 0.10)
+                  border.width: 1
+                  border.color: root.alpha(root.urgent, 0.4)
 
-        Column {
-          visible: root.editing
-          width: parent.width
-          spacing: Style.space(4)
+                  Column {
+                    id: actionColumn
+                    x: Style.space(6)
+                    y: Style.space(6)
+                    width: parent.width - Style.space(12)
+                    spacing: Style.space(4)
 
-          Text {
-            text: "Description · @" + root.selected + (root.selectedInfo ? "" : " (loading…)")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
+                    Text {
+                      width: parent.width
+                      wrapMode: Text.Wrap
+                      text: actionCard.action.kind === "approval"
+                        ? "@" + actionCard.action.member + " needs approval: " + (actionCard.action.description || actionCard.action.command)
+                        : "A turn ended without a clear result and waits for a retry."
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
 
-          TextField {
-            id: editDescField
-            width: parent.width
-            placeholderText: "role / description"
-            foreground: root.foreground
-          }
+                    Text {
+                      visible: actionCard.action.kind === "approval" && actionCard.action.description !== "" && actionCard.action.command !== ""
+                      width: parent.width
+                      wrapMode: Text.Wrap
+                      text: actionCard.action.command || ""
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
 
-          Text {
-            text: "SOUL.md"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
+                    Row {
+                      spacing: Style.spacing.sm
 
-          ScrollView {
-            width: parent.width
-            height: Style.space(120)
-            clip: true
+                      Repeater {
+                        model: actionCard.action.kind === "approval" ? actionCard.action.choices : ["retry"]
+                        Button {
+                          required property var modelData
+                          text: modelData === "once" ? "Approve once" : modelData === "deny" ? "Deny" : modelData === "retry" ? "Retry" : modelData
+                          bordered: true
+                          foreground: modelData === "deny" ? root.urgent : root.foreground
+                          fontFamily: root.fontFamily
+                          fontSize: Style.font.caption
+                          onClicked: modelData === "retry" ? root.retryRoomTask(actionCard.action.taskId)
+                            : root.answerRoomApproval(actionCard.action, modelData)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
 
-            TextArea {
-              id: soulArea
-              wrapMode: TextEdit.Wrap
-              placeholderText: "persona / standing instructions"
-              color: root.foreground
-              placeholderTextColor: root.dim
-              selectionColor: root.alpha(Color.accent, 0.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              background: Rectangle {
-                radius: Style.cornerRadius
-                color: root.alpha(root.foreground, 0.06)
-                border.width: 1
-                border.color: root.alpha(root.foreground, soulArea.activeFocus ? 0.5 : 0.2)
+              Item {
+                visible: root.openRoom !== "" && root.roomReply !== null
+                width: parent.width
+                implicitHeight: replyLine.implicitHeight
+
+                Text {
+                  id: replyLine
+                  anchors.left: parent.left
+                  anchors.right: replyCancel.left
+                  anchors.rightMargin: Style.space(8)
+                  elide: Text.ElideRight
+                  text: root.roomReply ? "↩ in thread" + (root.roomReply.who ? " with @" + root.roomReply.who : "") + ": "
+                    + root.roomReply.text.replace(/\s+/g, " ") : ""
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  id: replyCancel
+                  anchors.right: parent.right
+                  anchors.verticalCenter: replyLine.verticalCenter
+                  text: "×"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.roomReply = null
+                  }
+                }
+              }
+
+              TextField {
+                id: roomInput
+                visible: root.openRoom !== ""
+                width: parent.width
+                placeholderText: root.roomReply ? "Reply in this thread" : "Message the group  (@bot to address one)"
+                foreground: root.foreground
+                onAccepted: if (root.sendToRoom(text)) text = ""
               }
             }
-          }
 
-          Flow {
-            width: parent.width
-            spacing: Style.spacing.sm
+            Column {
+              visible: root.showingRoutines
+              width: parent.width
+              spacing: Style.space(2)
 
-            Button {
-              text: "Save"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.saveProfile(editDescField.text, soulArea.text)
-            }
-            Button {
-              text: root.selectedInfo && root.selectedInfo.pinned ? "Pinned" : "Pin"
-              bordered: true
-              selected: root.selectedInfo !== null && root.selectedInfo.pinned === true
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.setProfileFlag("pinned", !(root.selectedInfo && root.selectedInfo.pinned))
-            }
-            Button {
-              text: root.selectedInfo && root.selectedInfo.hidden ? "Hidden" : "Hide"
-              bordered: true
-              selected: root.selectedInfo !== null && root.selectedInfo.hidden === true
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.setProfileFlag("hidden", !(root.selectedInfo && root.selectedInfo.hidden))
-            }
-            TextField {
-              id: skillNameField
-              width: Style.space(120)
-              placeholderText: "skill name"
-              foreground: root.foreground
-              onAccepted: { if (root.saveLastPromptAsSkill(text)) text = "" }
-            }
-            Button {
-              text: "Save as skill"
-              bordered: true
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: { if (root.saveLastPromptAsSkill(skillNameField.text)) skillNameField.text = "" }
-            }
-            TextField {
-              id: duplicateField
-              width: Style.space(120)
-              placeholderText: "copy name"
-              foreground: root.foreground
-              onAccepted: root.duplicateProfile(text)
-            }
-            Button {
-              text: "Duplicate"
-              bordered: true
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.duplicateProfile(duplicateField.text)
-            }
-            Button {
-              text: "Export"
-              bordered: true
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.sendCommand({ cmd: "template.export", profile: root.selected })
-            }
-            TextField {
-              id: importPathField
-              width: Style.space(150)
-              placeholderText: "template .json path"
-              foreground: root.foreground
-            }
-            TextField {
-              id: importNameField
-              width: Style.space(100)
-              placeholderText: "new bot name"
-              foreground: root.foreground
-              onAccepted: root.sendCommand({ cmd: "template.import", path: importPathField.text, name: text })
-            }
-            Button {
-              text: "Import"
-              bordered: true
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.sendCommand({ cmd: "template.import", path: importPathField.text, name: importNameField.text })
-            }
-          }
-        }
+              PanelSectionHeader {
+                text: "ROUTINES · @" + root.selected
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
 
-        Flow {
-          visible: root.pickingModel
-          width: parent.width
-          spacing: Style.spacing.sm
+              Text {
+                visible: root.routines.length === 0
+                text: root.routinesLoaded ? "No routines for @" + root.selected : "Loading routines…"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
 
-          Repeater {
-            model: root.modelPresets
-            Button {
-              required property var modelData
-              text: modelData
-              selected: root.selectedProfile && root.selectedProfile.model === modelData
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              onClicked: root.setModel(modelData)
+              Repeater {
+                model: root.routines
+                Column {
+                  id: routineRow
+                  required property var modelData
+                  readonly property var runs: { root.revision; return root.routineRunsById[modelData.id] || null }
+                  width: parent.width
+                  spacing: Style.space(2)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: routineButtons.implicitHeight + Style.space(4)
+
+                    Text {
+                      anchors.left: parent.left
+                      anchors.leftMargin: Style.space(8)
+                      anchors.right: routineButtons.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: routineRow.modelData.name + " · " + routineRow.modelData.schedule_display
+                        + " · next " + (routineRow.modelData.paused ? "paused" : root.formatWhen(routineRow.modelData.next_run_at))
+                        + " · last " + (routineRow.modelData.last_status || "—")
+                      elide: Text.ElideRight
+                      wrapMode: Text.NoWrap
+                      color: routineRow.modelData.last_status && routineRow.modelData.last_status !== "ok" ? root.urgent
+                        : routineRow.modelData.paused ? root.dim : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Row {
+                      id: routineButtons
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(4)
+
+                      Button {
+                        text: "Runs"
+                        bordered: true
+                        selected: root.routineRunsShown === routineRow.modelData.id
+                        foreground: root.dim
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.toggleRoutineRuns(routineRow.modelData.id)
+                      }
+                      Button {
+                        text: "Run"
+                        bordered: true
+                        foreground: root.dim
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.routineCommand("run", routineRow.modelData.id)
+                      }
+                      Button {
+                        text: routineRow.modelData.paused ? "Resume" : "Pause"
+                        bordered: true
+                        foreground: root.dim
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.routineCommand(routineRow.modelData.paused ? "resume" : "pause", routineRow.modelData.id)
+                      }
+                      Button {
+                        text: root.armedRoutine === routineRow.modelData.id ? "Confirm" : "Delete"
+                        bordered: true
+                        foreground: root.armedRoutine === routineRow.modelData.id ? root.urgent : root.dim
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.requestRoutineDelete(routineRow.modelData.id)
+                      }
+                    }
+                  }
+
+                  Text {
+                    visible: root.routineRunsShown === routineRow.modelData.id && (routineRow.runs === null || routineRow.runs.length === 0)
+                    leftPadding: Style.space(20)
+                    text: routineRow.runs === null ? "Loading runs…" : "No runs yet"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Repeater {
+                    model: root.routineRunsShown === routineRow.modelData.id && routineRow.runs ? routineRow.runs : []
+                    Text {
+                      required property var modelData
+                      width: routineRow.width
+                      leftPadding: Style.space(20)
+                      rightPadding: Style.space(8)
+                      text: root.formatWhen(modelData.started_at) + (modelData.end_reason ? " · " + modelData.end_reason : "")
+                        + (modelData.title ? " · " + modelData.title : "")
+                      elide: Text.ElideRight
+                      wrapMode: Text.NoWrap
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                TextField {
+                  id: routineNameField
+                  width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.25
+                  placeholderText: "name"
+                  foreground: root.foreground
+                  onAccepted: routineScheduleField.forceActiveFocus()
+                }
+                TextField {
+                  id: routineScheduleField
+                  width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.25
+                  placeholderText: "every 1h"
+                  foreground: root.foreground
+                  onAccepted: routinePromptField.forceActiveFocus()
+                }
+                TextField {
+                  id: routinePromptField
+                  width: (parent.width - routineCreateButton.width - parent.spacing * 3) * 0.5
+                  placeholderText: "prompt"
+                  foreground: root.foreground
+                  onAccepted: root.createRoutine(routineNameField.text, routineScheduleField.text, text)
+                }
+                Button {
+                  id: routineCreateButton
+                  height: routineNameField.height
+                  text: "Create"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.createRoutine(routineNameField.text, routineScheduleField.text, routinePromptField.text)
+                }
+              }
             }
-          }
 
-          TextField {
-            id: modelField
-            width: Style.space(200)
-            placeholderText: "other model id"
-            foreground: root.foreground
-            onAccepted: { root.setModel(text); text = "" }
-          }
-        }
+            Column {
+              visible: root.editing
+              width: parent.width
+              spacing: Style.space(4)
 
-        Row {
-          visible: root.creating
-          width: parent.width
-          spacing: Style.spacing.sm
+              PanelSectionHeader {
+                text: "EDIT · @" + root.selected + (root.selectedInfo ? "" : "  (loading…)")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
 
-          TextField {
-            id: nameField
-            width: parent.width * 0.3
-            placeholderText: "name"
-            foreground: root.foreground
-            onAccepted: descField.forceActiveFocus()
-          }
-          TextField {
-            id: descField
-            width: parent.width * 0.5
-            placeholderText: "role / description"
-            foreground: root.foreground
-            onAccepted: root.createBot()
-          }
-          Button {
-            text: "Create"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            onClicked: root.createBot()
+              Text {
+                text: "Description"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              TextField {
+                id: editDescField
+                width: parent.width
+                placeholderText: "role / description"
+                foreground: root.foreground
+              }
+
+              Text {
+                text: "SOUL.md · persona and standing instructions"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              ScrollView {
+                width: parent.width
+                height: Style.space(120)
+                clip: true
+
+                TextArea {
+                  id: soulArea
+                  wrapMode: TextEdit.Wrap
+                  placeholderText: "persona / standing instructions"
+                  color: root.foreground
+                  placeholderTextColor: root.dim
+                  selectionColor: root.alpha(Color.accent, 0.4)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  background: Rectangle {
+                    radius: Style.cornerRadius
+                    color: root.alpha(root.foreground, 0.06)
+                    border.width: 1
+                    border.color: root.alpha(root.foreground, soulArea.activeFocus ? 0.5 : 0.2)
+                  }
+                }
+              }
+
+              Row {
+                spacing: Style.spacing.sm
+
+                Button {
+                  text: "Save"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.saveProfile(editDescField.text, soulArea.text)
+                }
+
+                Button {
+                  text: root.selectedInfo && root.selectedInfo.pinned ? "󰐃 Pinned" : "Pin"
+                  bordered: true
+                  selected: root.selectedInfo !== null && root.selectedInfo.pinned === true
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.setProfileFlag("pinned", !(root.selectedInfo && root.selectedInfo.pinned))
+                }
+
+                Button {
+                  text: root.selectedInfo && root.selectedInfo.hidden ? "Hidden" : "Hide"
+                  bordered: true
+                  selected: root.selectedInfo !== null && root.selectedInfo.hidden === true
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.setProfileFlag("hidden", !(root.selectedInfo && root.selectedInfo.hidden))
+                }
+              }
+
+              PanelSectionHeader {
+                topPadding: Style.space(8)
+                text: "SECTION"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Flow {
+                visible: root.sectionOrder.length > 0
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Repeater {
+                  model: root.sectionOrder
+                  Button {
+                    required property string modelData
+                    text: modelData
+                    bordered: true
+                    selected: root.selectedSection === modelData
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    // Clicking the bot's own section takes it out again.
+                    onClicked: root.setSection(selected ? "" : modelData)
+                  }
+                }
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: sectionField.implicitHeight
+
+                TextField {
+                  id: sectionField
+                  anchors.left: parent.left
+                  anchors.right: sectionButton.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "new section for @" + root.selected
+                  foreground: root.foreground
+                  onAccepted: {
+                    if (text.trim() === "") return
+                    root.setSection(text)
+                    text = ""
+                  }
+                }
+
+                Button {
+                  id: sectionButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  height: sectionField.height
+                  text: "Move"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: {
+                    if (sectionField.text.trim() === "") return
+                    root.setSection(sectionField.text)
+                    sectionField.text = ""
+                  }
+                }
+              }
+
+              PanelSectionHeader {
+                topPadding: Style.space(8)
+                text: "SAVE YOUR LAST MESSAGE AS A SKILL"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: skillNameField.implicitHeight
+
+                TextField {
+                  id: skillNameField
+                  anchors.left: parent.left
+                  anchors.right: saveSkillButton.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "skill name, e.g. weekly-report"
+                  foreground: root.foreground
+                  onAccepted: { if (root.saveLastPromptAsSkill(text)) text = "" }
+                }
+
+                Button {
+                  id: saveSkillButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  height: skillNameField.height
+                  text: "Save as skill"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: { if (root.saveLastPromptAsSkill(skillNameField.text)) skillNameField.text = "" }
+                }
+              }
+
+              PanelSectionHeader {
+                topPadding: Style.space(8)
+                text: "COPY AND SHARE"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: duplicateField.implicitHeight
+
+                TextField {
+                  id: duplicateField
+                  anchors.left: parent.left
+                  anchors.right: duplicateButton.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "name for a copy of @" + root.selected
+                  foreground: root.foreground
+                  onAccepted: root.duplicateProfile(text)
+                }
+
+                Button {
+                  id: duplicateButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  height: duplicateField.height
+                  text: "Duplicate"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.duplicateProfile(duplicateField.text)
+                }
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: exportButton.implicitHeight
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.right: exportButton.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Template file: ~/Downloads/hermes-bot-" + root.selected + ".json"
+                  elide: Text.ElideMiddle
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Button {
+                  id: exportButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Export"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.sendCommand({ cmd: "template.export", profile: root.selected })
+                }
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: importPathField.implicitHeight
+
+                TextField {
+                  id: importPathField
+                  anchors.left: parent.left
+                  anchors.right: importNameField.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "template .json path"
+                  foreground: root.foreground
+                  onAccepted: importNameField.forceActiveFocus()
+                }
+
+                TextField {
+                  id: importNameField
+                  anchors.right: importButton.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(110)
+                  placeholderText: "new bot name"
+                  foreground: root.foreground
+                  onAccepted: root.sendCommand({ cmd: "template.import", path: importPathField.text, name: text })
+                }
+
+                Button {
+                  id: importButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  height: importPathField.height
+                  text: "Import"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.sendCommand({ cmd: "template.import", path: importPathField.text, name: importNameField.text })
+                }
+              }
+
+              PanelSectionHeader {
+                visible: root.selected !== "default"
+                topPadding: Style.space(8)
+                text: "DELETE"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Button {
+                visible: root.selected !== "default"
+                text: root.armedDelete === root.selected ? "Click again to delete @" + root.selected + " for good" : "Delete @" + root.selected
+                bordered: true
+                foreground: root.urgent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.requestDelete(root.selected)
+              }
+            }
+
+            Column {
+              visible: root.pickingModel
+              width: parent.width
+              spacing: Style.space(4)
+
+              PanelSectionHeader {
+                text: "MODEL · @" + root.selected
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Flow {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Repeater {
+                  model: root.modelPresets
+                  Button {
+                    required property var modelData
+                    text: modelData
+                    selected: root.selectedProfile && root.selectedProfile.model === modelData
+                    bordered: true
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.setModel(modelData)
+                  }
+                }
+
+                TextField {
+                  id: modelField
+                  width: Style.space(200)
+                  placeholderText: "other model id"
+                  foreground: root.foreground
+                  onAccepted: { root.setModel(text); text = "" }
+                }
+              }
+            }
+
+            Column {
+              visible: root.creating
+              width: parent.width
+              spacing: Style.space(4)
+
+              PanelSectionHeader {
+                text: "NEW BOT"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                TextField {
+                  id: nameField
+                  width: (parent.width - createBotButton.width - parent.spacing * 2) * 0.35
+                  placeholderText: "name"
+                  foreground: root.foreground
+                  onAccepted: descField.forceActiveFocus()
+                }
+
+                TextField {
+                  id: descField
+                  width: (parent.width - createBotButton.width - parent.spacing * 2) * 0.65
+                  placeholderText: "role / description"
+                  foreground: root.foreground
+                  onAccepted: root.createBot()
+                }
+
+                Button {
+                  id: createBotButton
+                  height: nameField.height
+                  text: "Create"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.createBot()
+                }
+              }
+            }
           }
         }
 
@@ -2829,6 +3193,7 @@ Panel {
 
       Flickable {
         id: chatFlick
+        visible: !root.drawerTakesOver
         anchors.top: header.bottom
         anchors.topMargin: Style.space(8)
         anchors.bottom: footer.top
@@ -2860,11 +3225,15 @@ Panel {
           }
 
           Repeater {
-            model: root.shownMessages
+            model: chatModel
 
             Rectangle {
-              required property var modelData
+              // One transcript row as JSON, kept current by syncChat.
+              required property string row
+              readonly property var modelData: JSON.parse(row)
               readonly property bool mine: modelData.role === "you"
+              readonly property bool isBot: modelData.role === "bot"
+              readonly property Item bubbleBody: isBot ? bubbleMarkdown : bubbleText
               readonly property bool isTool: modelData.role === "tool"
               readonly property var images: modelData.images || []
               readonly property var files: modelData.files || []
@@ -2873,9 +3242,10 @@ Panel {
               property bool expanded: false
               width: isTool ? parent.width
                 : images.length > 0 || files.length > 0 || scaffold ? parent.width * 0.88
-                : Math.min(parent.width * 0.88, bubbleText.implicitWidth + Style.space(modelData.role === "bot" ? 34 : 20))
+                : Math.min(parent.width * 0.88, isBot ? bubbleMarkdown.naturalWidth + Style.space(34)
+                                                       : bubbleText.implicitWidth + Style.space(20))
               x: mine ? parent.width - width : 0
-              implicitHeight: (bubbleText.visible ? bubbleText.implicitHeight : 0) + imageColumn.implicitHeight
+              implicitHeight: (bubbleBody.visible ? bubbleBody.implicitHeight : 0) + imageColumn.implicitHeight
                 + Style.space(12)
               radius: Style.cornerRadius
               color: isTool ? "transparent" : root.alpha(root.foreground, mine ? 0.14 : 0.06)
@@ -2900,9 +3270,10 @@ Panel {
                 anchors.right: parent.right
                 anchors.topMargin: Style.space(6)
                 anchors.rightMargin: Style.space(6)
-                text: root.speaking ? "■" : "🔊"
+                text: root.speaking ? "󰓛" : "󰕾"
                 opacity: 0.55
                 color: root.dim
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 MouseArea {
                   anchors.fill: parent
@@ -2919,23 +3290,40 @@ Panel {
                 anchors.right: parent.right
                 anchors.margins: Style.space(6)
                 anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(modelData.role === "bot" ? 24 : 10)
+                anchors.rightMargin: Style.space(10)
                 visible: text !== ""
-                text: modelData.role === "bot" ? root.colorLinks(root.displayText(modelData.text))
+                text: isBot ? ""
                   : foldable && expanded ? String(modelData.full).trim()
                   : scaffold ? "⏱ scheduled job prompt — click to expand"
-                  : String(modelData.text || "").trim()
-                textFormat: modelData.role === "bot" ? Text.MarkdownText : Text.PlainText
+                  : root.attachmentRefs(String(modelData.text || "").trim())
+                textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 color: isTool ? root.dim : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: isTool ? Style.font.caption : Style.font.bodySmall
-                onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+              }
+
+              MarkdownBody {
+                id: bubbleMarkdown
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Style.space(6)
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(24)
+                visible: markdown !== ""
+                markdown: isBot ? root.displayText(modelData.text) : ""
+                color: root.foreground
+                linkColor: root.linkColor
+                codeBackground: root.alpha(root.foreground, 0.10)
+                fontFamily: root.fontFamily
+                pixelSize: Style.font.bodySmall
+                radius: Style.cornerRadius
               }
 
               Column {
                 id: imageColumn
-                anchors.top: bubbleText.visible ? bubbleText.bottom : parent.top
+                anchors.top: bubbleBody.visible ? bubbleBody.bottom : parent.top
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.margins: Style.space(6)
@@ -3369,8 +3757,8 @@ Panel {
             TextArea {
               id: input
               wrapMode: TextEdit.Wrap
-              placeholderText: root.busy ? "Steer @" + root.selected + " (Enter) or Queue for later"
-                : "Message @" + root.selected + "  (Shift+Enter: new line)"
+              placeholderText: root.busy ? "Steer @" + root.selected + " (Enter)"
+                : "Message @" + root.selected
               enabled: root.connected
               color: root.foreground
               placeholderTextColor: root.dim
@@ -3418,7 +3806,9 @@ Panel {
             id: micButton
             visible: !root.busy
             width: visible ? implicitWidth : 0
-            text: root.recording ? "■ Stop" : "Mic"
+            height: sendButton.height
+            iconText: root.recording ? "󰓛" : "󰍬"
+            tooltipText: root.recording ? "Stop dictation" : "Dictate (speech to text)"
             bordered: true
             selected: root.recording
             foreground: root.recording ? root.urgent : root.foreground
@@ -3430,7 +3820,10 @@ Panel {
           Button {
             id: imageButton
             visible: !root.busy
-            text: root.pendingImages.length + root.pendingFiles.length > 0 ? "Attach " + (root.pendingImages.length + root.pendingFiles.length) : "Attach"
+            height: sendButton.height
+            iconText: "󰏢"
+            text: root.pendingImages.length + root.pendingFiles.length > 0 ? String(root.pendingImages.length + root.pendingFiles.length) : ""
+            tooltipText: "Attach an image or file"
             bordered: true
             selected: root.attachOpen
             foreground: root.foreground
@@ -3441,19 +3834,23 @@ Panel {
 
           Button {
             id: modelButton
-            text: "Model"
+            height: sendButton.height
+            iconText: "󰧑"
+            tooltipText: "Model" + (root.selectedProfile ? ": " + root.selectedProfile.model : "")
             bordered: true
             selected: root.pickingModel
             foreground: root.foreground
             fontFamily: root.fontFamily
             fontSize: Style.font.bodySmall
-            onClicked: root.pickingModel = !root.pickingModel
+            onClicked: root.toggleModelPicker()
           }
 
           Button {
             id: newButton
             visible: !root.busy
-            text: "New"
+            height: sendButton.height
+            iconText: "󰐕"
+            tooltipText: "New chat (Ctrl+N)"
             bordered: true
             foreground: root.foreground
             fontFamily: root.fontFamily
