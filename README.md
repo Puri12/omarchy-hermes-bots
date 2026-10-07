@@ -145,11 +145,14 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 봇 데스크톱을 패널 안에서 보고 조작합니다.
 
 1. **Screen**을 누르면 패널이 넓어지고 대화 자리에 봇 화면이 뜹니다. 화면은 바뀔 때만, 초당 최대 약 8장으로 갱신됩니다.
-2. **Take over**를 누르면 클릭·드래그·휠·키보드가 봇 화면으로 갑니다. 화면을 한 번 누르면 테두리가 강조색이 되고 키 입력을 받으며, 그동안 패널 단축키는 꺼집니다.
-3. **Hand back**으로 봇에게 돌려줍니다. **Screen**을 다시 누르거나 패널을 닫으면 화면 받기도 멈춥니다.
+2. **Take over**를 누르면 클릭·드래그·휠·키보드가 봇 화면으로 갑니다. 화면을 한 번 누르면 테두리가 강조색이 되고 키 입력을 받으며, 그동안 패널 단축키는 꺼집니다. 한글처럼 입력기(IME)로 조합하는 글자는 화면 아래에 조합 중인 글자가 보이고, 글자가 완성되면 봇 화면에 입력됩니다.
+3. **Hand back**으로 봇에게 돌려줍니다. **Screen**을 다시 누르거나 패널을 닫아도 화면 받기가 멈추고 조작권은 봇에게 돌아갑니다.
+
+- 화면은 압축(ZRLE)해서 받습니다. 전체 화면 한 장이 약 50~60KB로, 압축하지 않을 때(1440×900에서 약 5MB)의 약 1%입니다.
+- 패널 두 개가 같은 봇 화면을 보면 화면 받기를 함께 씁니다. 한쪽이 닫히거나 사라져도 다른 쪽은 계속 보고, 보던 봇을 지우면 화면 받기도 멈춥니다.
 
 > [!NOTE]
-> 한글처럼 입력기(IME)를 거치는 글자는 전달되지 않습니다. 브라우저 페이지가 필요하면 화면 줄의 **Browser**를 누르세요.
+> 브라우저 페이지가 필요하면 화면 줄의 **Browser**를 누르세요.
 
 <details>
 <summary>시연으로 스킬 만들기 (Record demo)</summary>
@@ -361,7 +364,7 @@ omarchy-shell puri.hermes <함수> [인자…]
 | 패널 | `open` `close` `toggle` `show <bot>` `state` `reconnect` `geometry` `toggleModelPicker` `editView` `showHidden <true\|false>` |
 | 봇 | `select <bot>` `create <name> <desc>` `armDelete <name>` `deleteBot <name>` `profileGet` `profileSave <desc> <soul>` `profileDuplicate <newName>` `pin <true\|false>` `hide <true\|false>` `setModel <id>` `setEffort <level>` `effort` `section <name>` `sections` |
 | 템플릿 | `templateExport` `lastTemplate` `templateImport <path> <name>` |
-| 대화 | `send <text>` `steer <text>` `queue <text>` `stop` `newChat` `answer <text>` `search <text>` `quote <index>` `unread` `notices` |
+| 대화 | `send <text>` `steer <text>` `queue <text>` `stop` `newChat` `answer <text>` `approve <once\|session\|always\|deny>` `search <text>` `quote <index>` `unread` `notices` |
 | 첨부·파일 | `attachFile <path>` `attachClipboard` `files` `openFile <name>` |
 | 음성 | `dictate` `dictateFile <path>` `speakQuiet <text>` `lastSpeech` |
 | History | `sessions` `listed` `openSession <id>` `sessionRename <id> <title>` `sessionArchive <id>` `sessionDelete <id>` |
@@ -371,12 +374,14 @@ omarchy-shell puri.hermes <함수> [인자…]
 | 발송 초안 | `draftState` `draftAction <action>` |
 | 그룹 | `groupsView` `groups` `groupCreate <name> <bot,bot>` `groupOpen <id>` `groupSend <text>` `groupDisband <id>` `roomRename <name>` `roomReplyLast` `room` `roomAnswer <once\|deny>` `groupUnread` `showGroup <id>` |
 | 스킬 | `skills` `skillSave <name> <SKILL.md>` |
-| 시험용 | `setComposer <text>` `chatScroll <fraction>` `screenTap <fx> <fy>` `screenType <text>` `injectFrame <json>` |
+| 시험용 | `setComposer <text>` `chatScroll <fraction>` `screenTap <fx> <fy>` `screenType <text>` `screenKeyTest <qtKey> <text> <modifiers>` `injectFrame <json>` |
 
 - `skills`는 선택된 봇의 스킬 목록(캐시)을 JSON으로 돌려주고 새로 받아 옵니다. 서버가 스캔을 약 30초 캐시하므로 방금 저장한 스킬은 잠시 늦게 보일 수 있습니다.
 - `setComposer <text>`는 입력창 글을 바꾸고, 지금 보이는 스킬 제안 이름을 JSON으로 돌려줍니다.
 - `chatScroll <fraction>`은 대화를 스크롤 범위의 비율(0 맨 위, 1 맨 아래, 음수는 이동 없이 읽기)로 옮기고 위치를 돌려줍니다.
 - `screenTap`과 `screenType`은 패널 Screen의 마우스·키 경로로 클릭과 입력을 보냅니다(Take over 뒤에만 먹힘).
+- `screenKeyTest`는 Qt 키 코드·글자·수식키를 키보드와 같은 처리 함수에 넣고, 보낸 keysym(16진수)이나 `ime`(입력기에 맡김)를 돌려줍니다.
+- `approve`는 승인 카드의 버튼과 같은 답을 보냅니다.
 
 </details>
 
