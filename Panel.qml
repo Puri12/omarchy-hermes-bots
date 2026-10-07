@@ -1137,6 +1137,7 @@ Panel {
   function closeDrawers(keep) {
     if (keep !== "sessions") showingSessions = false
     if (keep !== "routines") showingRoutines = false
+    if (keep !== "artifacts") showingArtifacts = false
     if (keep !== "groups" && showingGroups) toggleGroups()
     if (keep !== "edit") editing = false
     if (keep !== "model") pickingModel = false
@@ -1160,6 +1161,33 @@ Panel {
     if (busy || !id) return false
     sendCommand({ cmd: "open", profile: selected, session: id })
     return true
+  }
+
+  // What the selected chat produced: images and files the bot sent, and links in its replies.
+  property bool showingArtifacts: false
+  function toggleArtifacts() {
+    if (!showingArtifacts) closeDrawers("artifacts")
+    showingArtifacts = !showingArtifacts
+  }
+  readonly property var artifacts: {
+    revision
+    var images = [], files = [], links = [], seen = {}
+    var linkRe = /\[([^\]\n]{1,80})\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<>()\[\]"'`]+)/g
+    for (var i = messages.length - 1; i >= 0; i--) {
+      var m = messages[i]
+      if (m.role !== "bot") continue
+      ;(m.images || []).forEach(function(local) { if (!seen[local]) { seen[local] = true; images.push({ local: local }) } })
+      ;(m.files || []).forEach(function(f) { if (!seen[f.local]) { seen[f.local] = true; files.push({ name: f.name, local: f.local }) } })
+      var text = String(m.text || ""), hit
+      linkRe.lastIndex = 0
+      while ((hit = linkRe.exec(text)) !== null) {
+        var url = (hit[2] || hit[3]).replace(/[.,;:!?]+$/, "")
+        if (seen[url]) continue
+        seen[url] = true
+        links.push({ url: url, label: hit[1] || url })
+      }
+    }
+    return { images: images, files: files, links: links }
   }
 
   function toggleRoutines() {
@@ -1805,6 +1833,8 @@ Panel {
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
     // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    function artifactsView(): string { root.toggleArtifacts(); return root.showingArtifacts ? "shown" : "hidden" }
+    function artifacts(): string { return JSON.stringify(root.artifacts) }
     function jumpPrompt(dir: int): string {
       var i = root.jumpPrompt(dir)
       return JSON.stringify({ row: i, y: Math.round(chatFlick.contentY), text: i >= 0 ? String(root.shownMessages[i].text).slice(0, 60) : "" })
@@ -2250,6 +2280,17 @@ Panel {
             }
 
             Button {
+              text: "Files"
+              tooltipText: "Images, files and links this chat produced"
+              selected: root.showingArtifacts
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.toggleArtifacts()
+            }
+
+            Button {
               text: "Routines"
               bordered: true
               selected: root.showingRoutines
@@ -2428,7 +2469,7 @@ Panel {
           id: drawerFlick
           // Bound to the drawer flags, not to drawerColumn's height: a hidden Column is never laid out,
           // so its implicitHeight would stay 0 and the drawer would never appear.
-          visible: root.showingSessions || root.showingGroups || root.showingRoutines || root.editing
+          visible: root.showingSessions || root.showingGroups || root.showingRoutines || root.showingArtifacts || root.editing
             || root.pickingModel || root.creating
           width: parent.width
           height: Math.min(drawerColumn.implicitHeight, Math.max(Style.space(110),
@@ -2968,6 +3009,89 @@ Panel {
                 placeholderText: root.roomReply ? "Reply in this thread" : "Message the group  (@bot to address one)"
                 foreground: root.foreground
                 onAccepted: if (root.sendToRoom(text)) text = ""
+              }
+            }
+
+            Column {
+              visible: root.showingArtifacts
+              width: parent.width
+              spacing: Style.space(4)
+
+              PanelSectionHeader {
+                text: "FILES · @" + root.selected
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                visible: root.artifacts.images.length + root.artifacts.files.length + root.artifacts.links.length === 0
+                text: "No images, files or links in this chat yet"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Flow {
+                visible: root.artifacts.images.length > 0
+                width: parent.width
+                spacing: Style.space(6)
+
+                Repeater {
+                  model: root.artifacts.images
+                  Image {
+                    required property var modelData
+                    width: Style.space(84)
+                    height: Style.space(84)
+                    fillMode: Image.PreserveAspectCrop
+                    asynchronous: true
+                    sourceSize.width: Style.space(168)
+                    source: "file://" + modelData.local
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: Qt.openUrlExternally("file://" + parent.modelData.local)
+                    }
+                  }
+                }
+              }
+
+              Repeater {
+                model: root.artifacts.files
+                Text {
+                  required property var modelData
+                  width: parent.width
+                  text: "󰈔 " + modelData.name
+                  elide: Text.ElideMiddle
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Qt.openUrlExternally("file://" + parent.modelData.local)
+                  }
+                }
+              }
+
+              Repeater {
+                model: root.artifacts.links
+                Text {
+                  required property var modelData
+                  width: parent.width
+                  text: "󰌷 " + modelData.label + (modelData.label !== modelData.url ? "  ·  " + modelData.url : "")
+                  elide: Text.ElideRight
+                  color: root.linkColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Qt.openUrlExternally(parent.modelData.url)
+                  }
+                }
               }
             }
 
