@@ -347,6 +347,19 @@ Panel {
 
   readonly property var routines: { revision; return routinesByProfile[selected] || [] }
   readonly property bool routinesLoaded: { revision; return routinesByProfile[selected] !== undefined }
+  // Routines of every bot in one list (each row carries its bot), or only the selected bot's.
+  property bool routinesAll: false
+  readonly property var routinesShown: {
+    revision
+    if (!routinesAll) return routines
+    var out = []
+    for (var i = 0; i < profiles.length; i++) {
+      var bot = profiles[i].name
+      var jobs = routinesByProfile[bot] || []
+      for (var j = 0; j < jobs.length; j++) out.push(Object.assign({ bot: bot }, jobs[j]))
+    }
+    return out
+  }
 
   readonly property var messages: { revision; return transcripts[selected] || [] }
   readonly property bool busy: { revision; return busyProfiles[selected] === true }
@@ -846,7 +859,7 @@ Panel {
     case "cron.running":
       cronRunning[ev.profile] = ev.running ? ev.job : ""
       revision++
-      if (showingRoutines && ev.profile === selected) refreshRoutines()
+      if (showingRoutines && (routinesAll || ev.profile === selected)) refreshRoutines()
       break
     case "routines":
       routinesByProfile[ev.profile] = ev.jobs || []
@@ -875,7 +888,7 @@ Panel {
         + (ev.status && ev.status !== "ok" ? " · " + ev.status + (ev.error ? ": " + ev.error : "") : ""))
       if (ev.text) pushMessage(ev.profile, "bot", ev.text)
       if (ev.notify) notify("@" + ev.profile + " · " + ev.job, ev.text || ev.error || ev.status, ev.profile)
-      if (showingRoutines && ev.profile === selected) refreshRoutines()
+      if (showingRoutines && (routinesAll || ev.profile === selected)) refreshRoutines()
       break
     case "attached":
       attaching = false
@@ -1213,13 +1226,24 @@ Panel {
   }
 
   function refreshRoutines() {
-    sendCommand({ cmd: "routines", profile: selected })
+    if (!routinesAll) {
+      sendCommand({ cmd: "routines", profile: selected })
+      return
+    }
+    for (var i = 0; i < profiles.length; i++) sendCommand({ cmd: "routines", profile: profiles[i].name })
   }
 
-  function routineCommand(action, id) {
+  function setRoutinesAll(on) {
+    routinesAll = on
+    routineRunsShown = ""
+    refreshRoutines()
+  }
+
+  // `profile` is the routine's own bot; the selected bot when omitted.
+  function routineCommand(action, id, profile) {
     if (!id) return false
     lastError = ""
-    sendCommand({ cmd: "routine." + action, profile: selected, id: id })
+    sendCommand({ cmd: "routine." + action, profile: profile || selected, id: id })
     return true
   }
 
@@ -1232,13 +1256,13 @@ Panel {
     return true
   }
 
-  function toggleRoutineRuns(id) {
+  function toggleRoutineRuns(id, profile) {
     routineRunsShown = routineRunsShown === id ? "" : id
-    if (routineRunsShown !== "") routineCommand("runs", id)
+    if (routineRunsShown !== "") routineCommand("runs", id, profile)
   }
 
   // Same two-click guard as bot delete.
-  function requestRoutineDelete(id) {
+  function requestRoutineDelete(id, profile) {
     if (!id) return false
     if (armedRoutine !== id) {
       armedRoutine = id
@@ -1249,7 +1273,7 @@ Panel {
     if (Date.now() - armedRoutineAt < 800) return false
     armedRoutine = ""
     routineDisarmTimer.stop()
-    return routineCommand("delete", id)
+    return routineCommand("delete", id, profile)
   }
 
   function formatWhen(v) {
@@ -1727,6 +1751,14 @@ Panel {
     function routineResume(id: string): string { return root.routineCommand("resume", id) ? "resuming" : "invalid" }
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
+    function routinesAllBots(on: bool): string {
+      if (!root.showingRoutines) root.toggleRoutines()
+      root.setRoutinesAll(on)
+      return "listing"
+    }
+    function routinesShown(): string {
+      return JSON.stringify(root.routinesShown.map(function(j) { return { bot: j.bot || root.selected, name: j.name, schedule: j.schedule_display } }))
+    }
     function routinesView(runsId: string): string {
       if (!root.showingRoutines) root.toggleRoutines()
       if (runsId && root.routineRunsShown !== runsId) root.toggleRoutineRuns(runsId)
@@ -2851,22 +2883,46 @@ Panel {
               width: parent.width
               spacing: Style.space(2)
 
-              PanelSectionHeader {
-                text: "ROUTINES · @" + root.selected
-                foreground: root.foreground
-                fontFamily: root.fontFamily
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(routinesHeader.implicitHeight, routinesScope.implicitHeight)
+
+                PanelSectionHeader {
+                  id: routinesHeader
+                  anchors.left: parent.left
+                  anchors.right: routinesScope.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "ROUTINES · " + (root.routinesAll ? "all bots" : "@" + root.selected)
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                }
+
+                Button {
+                  id: routinesScope
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "All bots"
+                  tooltipText: "Show the routines of every bot in one list"
+                  selected: root.routinesAll
+                  bordered: true
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.setRoutinesAll(!root.routinesAll)
+                }
               }
 
               Text {
-                visible: root.routines.length === 0
-                text: root.routinesLoaded ? "No routines for @" + root.selected : "Loading routines…"
+                visible: root.routinesShown.length === 0
+                text: root.routinesAll ? "No routines on any bot"
+                  : root.routinesLoaded ? "No routines for @" + root.selected : "Loading routines…"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
 
               Repeater {
-                model: root.routines
+                model: root.routinesShown
                 Column {
                   id: routineRow
                   required property var modelData
@@ -2884,7 +2940,8 @@ Panel {
                       anchors.right: routineButtons.left
                       anchors.rightMargin: Style.space(8)
                       anchors.verticalCenter: parent.verticalCenter
-                      text: routineRow.modelData.name + " · " + routineRow.modelData.schedule_display
+                      text: (routineRow.modelData.bot ? "@" + routineRow.modelData.bot + " · " : "")
+                        + routineRow.modelData.name + " · " + routineRow.modelData.schedule_display
                         + " · next " + (routineRow.modelData.paused ? "paused" : root.formatWhen(routineRow.modelData.next_run_at))
                         + " · last " + (routineRow.modelData.last_status || "—")
                       elide: Text.ElideRight
@@ -2908,7 +2965,7 @@ Panel {
                         foreground: root.dim
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
-                        onClicked: root.toggleRoutineRuns(routineRow.modelData.id)
+                        onClicked: root.toggleRoutineRuns(routineRow.modelData.id, routineRow.modelData.bot)
                       }
                       Button {
                         text: "Run"
@@ -2916,7 +2973,7 @@ Panel {
                         foreground: root.dim
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
-                        onClicked: root.routineCommand("run", routineRow.modelData.id)
+                        onClicked: root.routineCommand("run", routineRow.modelData.id, routineRow.modelData.bot)
                       }
                       Button {
                         text: routineRow.modelData.paused ? "Resume" : "Pause"
@@ -2924,7 +2981,7 @@ Panel {
                         foreground: root.dim
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
-                        onClicked: root.routineCommand(routineRow.modelData.paused ? "resume" : "pause", routineRow.modelData.id)
+                        onClicked: root.routineCommand(routineRow.modelData.paused ? "resume" : "pause", routineRow.modelData.id, routineRow.modelData.bot)
                       }
                       Button {
                         text: root.armedRoutine === routineRow.modelData.id ? "Confirm" : "Delete"
@@ -2932,7 +2989,7 @@ Panel {
                         foreground: root.armedRoutine === routineRow.modelData.id ? root.urgent : root.dim
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
-                        onClicked: root.requestRoutineDelete(routineRow.modelData.id)
+                        onClicked: root.requestRoutineDelete(routineRow.modelData.id, routineRow.modelData.bot)
                       }
                     }
                   }
