@@ -1535,6 +1535,12 @@ Panel {
       screenView.pointer(mx, my, 0)
       return JSON.stringify(screenView.framePoint(mx, my))
     }
+    // Answers the approval card the way its buttons do: once, session, always or deny.
+    function approve(choice: string): string {
+      if (!root.approval) return "no-approval"
+      root.answerApproval(choice)
+      return "answered"
+    }
     function screenType(text: string): string {
       for (var i = 0; i < text.length; i++) {
         var c = text.charCodeAt(i)
