@@ -675,6 +675,10 @@ Panel {
     case "session":
       sessionOwner[ev.session] = ev.profile
       break
+    case "caps":
+      capsByProfile[ev.profile] = ev
+      revision++
+      break
     case "context":
       contextByProfile[ev.profile] = ev
       revision++
@@ -1485,7 +1489,30 @@ Panel {
     pickingModel = !pickingModel
   }
 
-  function refreshProfile() { sendCommand({ cmd: "profile.get", profile: selected }) }
+  function refreshProfile() {
+    sendCommand({ cmd: "profile.get", profile: selected })
+    sendCommand({ cmd: "caps.get", profile: selected })
+  }
+
+  // Tool sets, MCP servers and skills each bot may use, as profiles.describe reports them.
+  property var capsByProfile: ({})
+  // Flips one entry and sends the whole list back (the server replaces it).
+  function toggleCap(part, name) {
+    var c = capsByProfile[selected]
+    if (!c) return false
+    var list = part === "toolsets" ? c.toolsets : part === "skills" ? c.skills : c.mcp
+    var names = [], found = false
+    for (var i = 0; i < list.length; i++) {
+      var on = list[i].name === name ? !list[i].enabled : list[i].enabled
+      if (list[i].name === name) found = true
+      // Skills are sent as the disabled ones; tool sets and MCP servers as the enabled ones.
+      if (part === "skills" ? !on : on) names.push(list[i].name)
+    }
+    if (!found) return false
+    lastError = ""
+    sendCommand({ cmd: "caps.set", profile: selected, part: part, names: names })
+    return true
+  }
 
   function refreshSkills() { if (selected) sendCommand({ cmd: "skills", profile: selected }) }
 
@@ -1866,6 +1893,8 @@ Panel {
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
     // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    function caps(): string { return JSON.stringify(root.capsByProfile[root.selected] || null) }
+    function toggleCap(part: string, name: string): string { return root.toggleCap(part, name) ? "setting" : "invalid" }
     function contextView(): string { root.toggleContext(); return root.showingContext ? "shown" : "hidden" }
     function context(): string { return JSON.stringify(root.contextByProfile[root.selected] || null) }
     function setYolo(on: bool): string { return root.setYolo(on) ? "setting" : "invalid" }
@@ -3463,6 +3492,60 @@ Panel {
                   fontFamily: root.fontFamily
                   fontSize: Style.font.caption
                   onClicked: root.setProfileFlag("hidden", !(root.selectedInfo && root.selectedInfo.hidden))
+                }
+              }
+
+              PanelSectionHeader {
+                topPadding: Style.space(8)
+                text: "CAPABILITIES · new chats"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                // One row per kind: what the bot may use. Click an entry to switch it.
+                model: [
+                  { part: "toolsets", title: "Tool sets" },
+                  { part: "mcp", title: "MCP servers" },
+                  { part: "skills", title: "Skills" }
+                ]
+                Column {
+                  id: capGroup
+                  required property var modelData
+                  readonly property var entries: {
+                    root.revision
+                    var c = root.capsByProfile[root.selected]
+                    return !c ? [] : modelData.part === "toolsets" ? c.toolsets : modelData.part === "skills" ? c.skills : c.mcp
+                  }
+                  width: parent.width
+                  spacing: Style.space(2)
+
+                  Text {
+                    text: capGroup.modelData.title + (capGroup.entries.length === 0 ? "  ·  none" : "")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Flow {
+                    width: parent.width
+                    spacing: Style.space(4)
+
+                    Repeater {
+                      model: capGroup.entries
+                      Button {
+                        required property var modelData
+                        text: (modelData.label || modelData.name) + (modelData.count ? " " + modelData.count : "")
+                        tooltipText: modelData.description || modelData.transport || modelData.name
+                        selected: modelData.enabled
+                        bordered: true
+                        foreground: modelData.enabled ? root.foreground : root.dim
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.toggleCap(capGroup.modelData.part, modelData.name)
+                      }
+                    }
+                  }
                 }
               }
 

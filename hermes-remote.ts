@@ -58,6 +58,8 @@ type Command =
   | { cmd: "effort.get"; profile: string }
   | { cmd: "yolo"; profile: string; on: boolean }
   | { cmd: "context"; profile: string }
+  | { cmd: "caps.get"; profile: string }
+  | { cmd: "caps.set"; profile: string; part: "toolsets" | "skills" | "mcp"; names: string[] }
   | { cmd: "subagents"; profile: string }
   | { cmd: "subagent.steer"; profile: string; id: string; text: string }
   | { cmd: "subagent.stop"; profile: string; id: string }
@@ -1476,6 +1478,29 @@ class Remote {
     this.out({ ev: "effort", profile, value: String(r.value ?? "") });
   }
 
+  // What a bot may use: tool sets, MCP servers and its installed skills (the Hermes Desktop editor's view).
+  async capsGet(profile: string) {
+    await this.requireProfile(profile);
+    const r = await this.rpc("profiles.describe", { name: profile });
+    const list = (v: unknown) => (Array.isArray(v) ? (v as Json[]) : []);
+    this.out({ ev: "caps", profile, pinned: r.toolsets_pinned === true,
+      toolsets: list(r.toolsets).map((t) => ({ name: String(t.name), label: String(t.label || t.name),
+        description: String(t.description ?? ""), count: Number(t.tool_count ?? 0), enabled: t.enabled === true })),
+      skills: list(r.skills).map((s) => ({ name: String(s.name), enabled: s.enabled !== false })),
+      mcp: list(r.mcp_servers).map((m) => ({ name: String(m.name), enabled: m.enabled !== false, transport: String(m.transport ?? "") })) });
+  }
+
+  // Replaces one list: enabled tool sets (empty = back to the default set), disabled skills, or
+  // enabled MCP servers. New chats pick it up.
+  async capsSet(profile: string, part: "toolsets" | "skills" | "mcp", names: string[]) {
+    await this.requireProfile(profile);
+    const param = { toolsets: "enabled_toolsets", skills: "disabled_skills", mcp: "enabled_mcp_servers" }[part];
+    const field = { toolsets: "toolsets", skills: "skills", mcp: "mcp_servers" }[part];
+    const r = await this.rpc("profiles.configure", { name: profile, [param]: names });
+    if (((r.applied as Json | undefined) ?? {})[field] === false) throw new RemoteError(`could not change @${profile}'s ${part}`);
+    await this.capsGet(profile);
+  }
+
   // What fills the open chat's context window, by kind (system prompt, tools, skills, memory, ...).
   async contextBreakdown(profile: string) {
     const sid = this.sessionByProfile.get(profile);
@@ -2209,6 +2234,8 @@ class Remote {
       case "effort.get": return this.effortGet(c.profile);
       case "yolo": return this.yoloSet(c.profile, c.on);
       case "context": return this.contextBreakdown(c.profile);
+      case "caps.get": return this.capsGet(c.profile);
+      case "caps.set": return this.capsSet(c.profile, c.part, c.names);
       case "subagents": return this.subagentList(c.profile);
       case "subagent.steer": return this.subagentSteer(c.profile, c.id, c.text);
       case "subagent.stop": return this.subagentStop(c.profile, c.id);
