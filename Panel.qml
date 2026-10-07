@@ -69,6 +69,35 @@ Panel {
     if (speaking) { sendCommand({ cmd: "speak.stop" }); speaking = false; return }
     sendCommand({ cmd: "speak", profile: selected, text: displayText(text), play: true })
   }
+  // The selected bot's live workers, for the worker rows above the composer.
+  readonly property var workers: { revision; return runningSubagents(selected) }
+  // Worker the composer's next message goes to instead of the bot; "" = the bot.
+  property string steerWorker: ""
+  function workerLine(w) {
+    if (!w) return ""
+    var secs = w.since ? Math.max(0, Math.round((nowMs - w.since) / 1000)) : 0
+    // Time and latest activity first: the goal is long and is what gets elided.
+    return "🔀 " + (secs >= 60 ? Math.floor(secs / 60) + "m " + (secs % 60) + "s" : secs + "s") + (w.tool ? "  ·  " + w.tool : "")
+      + "  ·  " + (w.goal || w.id)
+  }
+  function steerWorkerText(id, raw) {
+    var text = String(raw || "").trim()
+    if (text === "" || !id) return false
+    sendCommand({ cmd: "subagent.steer", profile: selected, id: id, text: text })
+    steerWorker = ""
+    return true
+  }
+  function stopWorker(id) {
+    if (!id) return false
+    sendCommand({ cmd: "subagent.stop", profile: selected, id: id })
+    return true
+  }
+  // With text in the composer the Steer button sends it; with none it aims the composer at the worker.
+  function aimWorker(id) {
+    if (steerWorkerText(id, input.text)) { input.text = ""; return }
+    steerWorker = steerWorker === id ? "" : id
+    input.forceActiveFocus()
+  }
   function runningSubagents(profile) {
     var map = subagentsByProfile[profile] || {}
     var out = []
@@ -256,9 +285,7 @@ Panel {
       var subs = runningSubagents(selected)
       return label + " · " + secs + "s" + (subs.length > 0 ? "  ·  🔀 " + subs.length + " delegated" + (subs[0].tool ? ": " + subs[0].tool : "") : "")
     }
-    // delegate_task runs in the background, so children can outlive the parent's turn.
-    var running = runningSubagents(selected)
-    if (running.length > 0) return "🔀 " + running.length + " delegated task" + (running.length > 1 ? "s" : "") + " running" + (running[0].tool ? ": " + running[0].tool : "")
+    // Workers that outlive the parent's turn have their own rows above the composer.
     return cron ? "⏱ scheduled job running: " + cron : ""
   }
   readonly property bool waitingOnUser: clarify !== null || approval !== null
@@ -324,6 +351,7 @@ Panel {
     // A bot that was just removed has no draft to keep.
     if (draftOwner === "default" || profiles.some(function(p) { return p.name === draftOwner })) draftByProfile[draftOwner] = input.text
     draftOwner = selected
+    steerWorker = ""
     input.text = draftByProfile[selected] || ""
     input.cursorPosition = input.text.length
     followChat()
@@ -528,6 +556,7 @@ Panel {
       }
       break
     case "history":
+      if (ev.session) sendCommand({ cmd: "subagents", profile: ev.profile })
       if (ev.session) sessionOwner[ev.session] = ev.profile
       if (ev.replace) {
         transcripts[ev.profile] = compactTools(tidyHistory(ev.messages))
@@ -667,18 +696,43 @@ Panel {
     case "subagent":
       var parentBot = profileForSession(ev.session)
       var subs = subagentsByProfile[parentBot] || {}
-      var sub = subs[ev.id] || { id: ev.id, goal: ev.goal, tool: "", count: 0, done: false }
+      var sub = subs[ev.id] || { id: ev.id, goal: ev.goal, tool: "", count: 0, done: false, since: Date.now() }
       if (ev.goal) sub.goal = ev.goal
       if (ev.phase === "tool" && ev.tool) { sub.tool = ev.tool; sub.count = ev.count }
       if (ev.phase === "start") pushMessage(parentBot, "tool", "🔀 delegated: " + sub.goal)
       if (ev.phase === "done") {
         sub.done = true
+        if (steerWorker === ev.id) steerWorker = ""
         pushMessage(parentBot, "tool", "🔀 " + (ev.status || "done") + (ev.secs ? " in " + Math.round(ev.secs) + "s" : "") + " · " + sub.goal
           + (ev.summary ? " — " + ev.summary.split("\n")[0] : ""))
       }
       subs[ev.id] = sub
       subagentsByProfile[parentBot] = subs
       revision++
+      break
+    case "subagents":
+      var live = subagentsByProfile[ev.profile] || {}
+      var listed = {}
+      for (var li = 0; li < ev.list.length; li++) {
+        var row = ev.list[li]
+        var known = live[row.id] || { id: row.id, goal: row.goal, tool: "", count: 0, done: false }
+        known.since = row.startedAt || known.since || Date.now()
+        if (row.tool) known.tool = row.tool
+        known.count = Math.max(known.count, row.count)
+        live[row.id] = known
+        listed[row.id] = true
+      }
+      // Not on the server's list any more: it ended while this panel was not listening.
+      for (var lid in live) if (!listed[lid]) live[lid].done = true
+      subagentsByProfile[ev.profile] = live
+      revision++
+      break
+    case "subagent.steered":
+      pushMessage(ev.profile, ev.error || ev.status !== "queued" ? "tool" : "you", ev.error ? "↪ worker steer failed: " + ev.error
+        : ev.status !== "queued" ? "↪ worker did not take the message (it may have finished)" : "↪ to worker: " + ev.text)
+      break
+    case "subagent.stopped":
+      pushMessage(ev.profile, "tool", ev.found ? "⏹ worker asked to stop" : "⏹ worker was not running any more")
       break
     case "todos":
       todosByProfile[profileForSession(ev.session)] = ev.todos || []
@@ -878,7 +932,8 @@ Panel {
   }
 
   function submit() {
-    if (busy) steerText(input.text, "steer")
+    if (steerWorker !== "") steerWorkerText(steerWorker, input.text)
+    else if (busy) steerText(input.text, "steer")
     else sendText(input.text)
     input.text = ""
   }
@@ -1450,6 +1505,9 @@ Panel {
     function unread(): string { return JSON.stringify(root.unreadProfiles) }
     function notices(): string { return JSON.stringify(root.noticeList) }
     function subagents(): string { return JSON.stringify(root.subagentsByProfile[root.selected] || {}) }
+    function workers(): string { return JSON.stringify(root.workers) }
+    function workerSteer(id: string, text: string): string { return root.steerWorkerText(id, text) ? "steering" : "invalid" }
+    function workerStop(id: string): string { return root.stopWorker(id) ? "stopping" : "invalid" }
     function dictate(): string { root.toggleDictation(); return root.recording ? "stopping" : "recording" }
     // Test hooks: synthesise without playing, and transcribe an existing audio file.
     function speakQuiet(text: string): string { root.sendCommand({ cmd: "speak", profile: root.selected, text: text, play: false }); return "synthesising" }
@@ -1674,7 +1732,7 @@ Panel {
   property bool reconnectPending: false
   property bool primaryClient: false
   Timer { interval: 60000; running: true; repeat: true; onTriggered: root.sendCommand({ cmd: "refresh" }) }
-  Timer { interval: 1000; running: root.anyBusy; repeat: true; onTriggered: root.nowMs = Date.now() }
+  Timer { interval: 1000; running: root.anyBusy || root.workers.length > 0; repeat: true; onTriggered: root.nowMs = Date.now() }
   Component.onCompleted: bridge.running = true
 
   onOpenedChanged: if (opened) {
@@ -3637,6 +3695,58 @@ Panel {
           }
         }
 
+        // Live delegated workers. The count is the model so a streaming reply (revision bumps) does
+        // not rebuild the rows under the pointer.
+        Column {
+          visible: root.workers.length > 0
+          width: parent.width
+          spacing: Style.space(2)
+
+          Repeater {
+            model: root.workers.length
+            Row {
+              id: workerRow
+              required property int index
+              readonly property var worker: root.workers[index] || null
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              Text {
+                width: parent.width - workerSteer.width - workerStop.width - parent.spacing * 2
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.workerLine(workerRow.worker)
+                elide: Text.ElideRight
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Button {
+                id: workerSteer
+                text: "Steer"
+                tooltipText: "Send the typed message to this worker"
+                selected: workerRow.worker !== null && root.steerWorker === workerRow.worker.id
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: if (workerRow.worker) root.aimWorker(workerRow.worker.id)
+              }
+
+              Button {
+                id: workerStop
+                text: "Stop"
+                tooltipText: "Stop this worker only"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: if (workerRow.worker) root.stopWorker(workerRow.worker.id)
+              }
+            }
+          }
+        }
+
         // One Text per item: ElideRight does not elide the lines of a multi-line NoWrap Text.
         Column {
           visible: root.selectedTodos.length > 0
@@ -3832,7 +3942,8 @@ Panel {
             TextArea {
               id: input
               wrapMode: TextEdit.Wrap
-              placeholderText: root.busy ? "Steer @" + root.selected + " (Enter)"
+              placeholderText: root.steerWorker !== "" ? "Message the worker (Enter) · press Steer again to cancel"
+                : root.busy ? "Steer @" + root.selected + " (Enter)"
                 : "Message @" + root.selected
               enabled: root.connected
               color: root.foreground

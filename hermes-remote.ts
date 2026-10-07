@@ -56,6 +56,9 @@ type Command =
   | { cmd: "clarify"; requestId: string | number; answer: string; questionId?: string }
   | { cmd: "model"; profile: string; provider: string; model: string }
   | { cmd: "effort.get"; profile: string }
+  | { cmd: "subagents"; profile: string }
+  | { cmd: "subagent.steer"; profile: string; id: string; text: string }
+  | { cmd: "subagent.stop"; profile: string; id: string }
   | { cmd: "effort.set"; profile: string; value: string }
   | { cmd: "attach"; profile: string; path?: string; clipboard?: boolean }
   | { cmd: "sessions"; profile: string }
@@ -931,6 +934,35 @@ class Remote {
     if (sid) await this.rpc("session.interrupt", { session_id: sid });
   }
 
+  // Delegated workers of this bot's open chat, straight from the server, so a panel that
+  // reloaded mid-run shows the ones it never saw start.
+  async subagentList(profile: string) {
+    const sid = this.sessionByProfile.get(profile);
+    if (!sid) return;
+    const r = await this.rpc("subagent.list", { session_id: sid });
+    const rows = Array.isArray(r.subagents) ? (r.subagents as Json[]) : [];
+    emit({ ev: "subagents", profile, list: rows.filter((s) => s.subagent_id).map((s) => ({
+      id: String(s.subagent_id), goal: String(s.goal ?? "").slice(0, 160), tool: String(s.last_tool ?? "").slice(0, 80),
+      count: Number(s.tool_count ?? 0), startedAt: Math.round(Number(s.started_at ?? 0) * 1000) })) });
+  }
+
+  // The worker reads the text after its current tool call; "queued" is accepted, not yet read.
+  async subagentSteer(profile: string, id: string, text: string) {
+    const sid = this.sessionByProfile.get(profile);
+    try {
+      const r = sid ? await this.rpc("subagent.steer", { session_id: sid, subagent_id: id, text }) : { status: "rejected" };
+      emit({ ev: "subagent.steered", profile, id, status: String(r.status), text });
+    } catch (e) {
+      emit({ ev: "subagent.steered", profile, id, text, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  async subagentStop(profile: string, id: string) {
+    const sid = this.sessionByProfile.get(profile);
+    const r = sid ? await this.rpc("subagent.interrupt", { session_id: sid, subagent_id: id }) : { found: false };
+    emit({ ev: "subagent.stopped", profile, id, found: r.found === true });
+  }
+
   async listSessions(profile: string) {
     await this.requireProfile(profile);
     const r = await this.rpc("session.list", { limit: 20, ...this.profileParam(profile) });
@@ -1731,6 +1763,9 @@ class Remote {
       case "clarify": return this.answerClarify(c.requestId, c.answer, c.questionId);
       case "model": return this.setModel(c.profile, c.provider, c.model);
       case "effort.get": return this.effortGet(c.profile);
+      case "subagents": return this.subagentList(c.profile);
+      case "subagent.steer": return this.subagentSteer(c.profile, c.id, c.text);
+      case "subagent.stop": return this.subagentStop(c.profile, c.id);
       case "effort.set": return this.effortSet(c.profile, c.value);
       case "attach": return this.attach(c.profile, { path: c.path, clipboard: c.clipboard });
       case "sessions": return this.listSessions(c.profile);
