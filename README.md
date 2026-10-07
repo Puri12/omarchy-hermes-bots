@@ -2,6 +2,12 @@
 
 Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 봇을 만들고 관리하고 대화하는 플러그인.
 
+| 대화 | 패널 안 Screen |
+| --- | --- |
+| <img src="docs/chat.png" width="320" alt="봇 대화: Markdown 표 답변과 봇의 할 일 목록"> | <img src="docs/screen.png" width="520" alt="패널 안에서 봇 데스크톱을 넘겨받아 터미널에 입력한 모습"> |
+
+캐처의 다른 봇 이름과 계정 정보는 흐리게 가렸습니다.
+
 - `Panel.qml` — 바 아이콘과 패널 UI (Quickshell, `qs.Ui` 컴포넌트)
 - `hermes-remote.ts` — Bun 헬퍼. 패널과 NDJSON(stdin/stdout)으로 통신하고, `hermes serve`의 REST와 `/api/ws` JSON-RPC에 붙음 (아래 "헬퍼 데몬")
 - `novnc/` — 봇 화면 보기용 noVNC 1.7.0 (MPL-2.0, `novnc/LICENSE.txt`)
