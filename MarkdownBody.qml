@@ -184,8 +184,9 @@ Column {
       required property string content
       readonly property bool code: kind === "code"
       readonly property real pad: code ? Math.round(body.pixelSize * 0.6) : 0
-      // Reading implicitWidth or implicitHeight makes Text lay the block out a second time, unwrapped.
-      readonly property real naturalWidth: content.length > 120 ? Infinity : blockText.implicitWidth + 2 * pad
+      // Short blocks are measured on an unwrapped copy: blockText follows the body's width, which follows
+      // this, so reading blockText's own implicitWidth here is a binding loop. Long blocks fill the width.
+      readonly property real naturalWidth: content.length > 120 ? Infinity : measureText.implicitWidth + 2 * pad
       width: body.width
       implicitHeight: blockText.height + 2 * pad
       color: code ? body.codeBackground : "transparent"
@@ -204,6 +205,14 @@ Column {
         font.family: body.fontFamily
         font.pixelSize: body.pixelSize
         onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+      }
+
+      Text {
+        id: measureText
+        visible: false
+        text: block.content.length > 120 ? "" : blockText.text
+        textFormat: blockText.textFormat
+        font: blockText.font
       }
     }
   }

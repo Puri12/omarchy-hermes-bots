@@ -3609,7 +3609,7 @@ Panel {
               width: isTool ? parent.width
                 : images.length > 0 || files.length > 0 || scaffold ? parent.width * 0.88
                 : Math.min(parent.width * 0.88, isBot ? bubbleMarkdown.naturalWidth + Style.space(34)
-                                                       : bubbleText.implicitWidth + Style.space(20))
+                                                       : bubbleMeasure.implicitWidth + Style.space(20))
               x: mine ? parent.width - width : 0
               implicitHeight: (bubbleBody.visible ? bubbleBody.implicitHeight : 0) + imageColumn.implicitHeight
                 + Style.space(12)
@@ -3667,6 +3667,16 @@ Panel {
                 color: isTool ? root.dim : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: isTool ? Style.font.caption : Style.font.bodySmall
+              }
+
+              // The bubble's width comes from this unwrapped copy: bubbleText is anchored to the bubble,
+              // so sizing the bubble from bubbleText's own implicitWidth is a binding loop.
+              Text {
+                id: bubbleMeasure
+                visible: false
+                text: isTool || isBot || images.length > 0 || files.length > 0 || scaffold ? "" : bubbleText.text
+                textFormat: Text.PlainText
+                font: bubbleText.font
               }
 
               MarkdownBody {
