@@ -68,7 +68,9 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 - **스크롤** — 맨 아래에 있을 때만 새 글을 따라갑니다. 위로 올려 읽는 동안에는 답이 들어와도 자리가 그대로이고, 보내기·봇 바꾸기·맨 아래로 내리기를 하면 다시 따라갑니다.
 - **입력 초안** — 보내지 않은 글은 봇마다 따로 기억됩니다. 셸을 다시 시작하면 지워집니다.
 - **여러 줄 입력** — <kbd>Shift</kbd>+<kbd>Enter</kbd>로 줄바꿈합니다.
-- **첨부** — 이미지·파일 보내기와 받기(파일 칩).
+- **첨부** — 이미지·파일 보내기와 받기(파일 칩). 파일 관리자에서 패널로 끌어다 놓아도 첨부됩니다(여러 개면 차례로).
+- **Files** — 지금 대화가 만든 그림(썸네일)·파일·링크를 한곳에 모아 보여 주고, 누르면 엽니다.
+- **내 질문으로 이동** — 긴 대화에서 오른쪽 아래 ↑ / ↓ 버튼(또는 <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>↓</kbd>)으로 내가 보낸 이전·다음 메시지로 갑니다. 마지막을 지나면 다시 새 글을 따라갑니다.
 - **대화 검색** — History 옆 **Search**로 현재 대화에서 글자가 들어간 줄만 보입니다(일치 수 표시, <kbd>Esc</kbd>로 닫기).
 - **답장 인용** — 말풍선을 오른쪽 클릭하면 입력창 위에 `↩ replying to`가 뜨고, 보낼 때 `> ` 인용으로 붙습니다(× 로 취소).
 - **History** — 지난 대화 열기, 이름 바꾸기, 보관, 삭제(두 번 클릭). 다시 불러온 대화의 cron 지시문과 첨부 확장문은 접혀 있고 클릭하면 펼쳐집니다.
@@ -95,8 +97,12 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 | 추론 강도 | 모델 버튼 → **REASONING**에서 `none` … `max` |
 | 구역(섹션)으로 묶기 | Edit → **SECTION** |
 | 템플릿 내보내기·가져오기 | Edit → **Export** / **Import** |
+| 아바타 | Edit → **AVATAR** (그림 경로 → **Set**, **Remove**) |
+| 쓸 수 있는 도구 묶음·MCP 서버·스킬 | Edit → **CAPABILITIES** |
 
 - **추론 강도**는 그 봇의 `config.yaml`(`agent.reasoning_effort`)에 저장되고, 열려 있는 대화에도 바로 적용됩니다. 모델 옆에 `reasoning <값>`으로 표시됩니다.
+- **아바타**는 PNG·JPEG·WebP 2MB 이하이고, Hermes Desktop과 같은 프로필 자산에 저장되며 모델 줄 앞에 작게 보입니다.
+- **CAPABILITIES**는 도구 묶음(도구 수 표시), MCP 서버, 설치된 스킬을 눌러서 켜고 끕니다. 새 대화부터 적용됩니다. 도구 묶음을 모두 끄면 기본 묶음으로 돌아갑니다(서버 동작).
 
 <details>
 <summary>봇 구역(SECTION) 자세히</summary>
@@ -127,6 +133,8 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 | 봇이 일을 나눠 맡김(`delegate_task`) | 입력창 위에 작업자마다 한 줄, **Steer** / **Stop** |
 | 봇이 할 일 목록을 씀 | 입력창 위에 할 일 목록 |
 | 루틴(cron)이 끝남 | 완료 알림 |
+| 이 대화에서는 매번 승인하기 싫음 | 모델 버튼 → **APPROVALS** → **Skip (YOLO)** (새 대화는 다시 물음) |
+| 컨텍스트가 무엇으로 차 있는지 | 모델 줄을 누르면 항목별(시스템 프롬프트·도구 정의·스킬·MCP·기억·대화) 막대 |
 
 <details>
 <summary>위임 작업자 자세히</summary>
@@ -138,7 +146,7 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 
 </details>
 
-**Routines**에서는 루틴 목록·만들기·즉시 실행·일시정지·삭제·실행 기록을 다룹니다.
+**Routines**에서는 루틴 목록·만들기·즉시 실행·일시정지·삭제·실행 기록을 다룹니다. **All bots**를 켜면 모든 봇의 루틴이 봇 이름과 함께 한 목록에 나오고, 각 행의 버튼은 그 행의 봇에 동작합니다.
 
 ### Screen
 
@@ -263,8 +271,15 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 | <kbd>Ctrl</kbd>+<kbd>K</kbd> | History |
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> | 대화 검색 |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> | 마지막으로 보낸 메시지 불러오기 (입력창이 비어 있을 때) |
+| <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>↓</kbd> | 내 이전 / 다음 메시지로 이동 |
 | <kbd>Alt</kbd>+<kbd>1</kbd> … <kbd>Alt</kbd>+<kbd>9</kbd> | 봇 목록의 N번째 봇 선택 |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | 줄바꿈 |
+
+어디서든 빠르게 메시지를 쓰려면 Hyprland 단축키에 `quick`을 묶습니다. 패널이 선택된 봇으로 열리고 입력창에 바로 쓸 수 있으며, 쓰는 중에 다시 누르면 닫힙니다. `~/.config/hypr/bindings.lua`에:
+
+```lua
+o.bind("SUPER + ALT + H", "Hermes Bots quick message", "omarchy-shell puri.hermes quick")
+```
 
 봇 목록의 봇 이름 옆 표시입니다.
 
@@ -361,15 +376,15 @@ omarchy-shell puri.hermes <함수> [인자…]
 
 | 묶음 | 함수 |
 | --- | --- |
-| 패널 | `open` `close` `toggle` `show <bot>` `state` `reconnect` `geometry` `toggleModelPicker` `editView` `showHidden <true\|false>` |
-| 봇 | `select <bot>` `create <name> <desc>` `armDelete <name>` `deleteBot <name>` `profileGet` `profileSave <desc> <soul>` `profileDuplicate <newName>` `pin <true\|false>` `hide <true\|false>` `setModel <id>` `setEffort <level>` `effort` `section <name>` `sections` |
+| 패널 | `open` `close` `toggle` `quick` `show <bot>` `state` `reconnect` `geometry` `toggleModelPicker` `editView` `showHidden <true\|false>` `contextView` `context` `artifactsView` `artifacts` `jumpPrompt <-1\|1>` |
+| 봇 | `select <bot>` `create <name> <desc>` `armDelete <name>` `deleteBot <name>` `profileGet` `profileSave <desc> <soul>` `profileDuplicate <newName>` `pin <true\|false>` `hide <true\|false>` `setModel <id>` `setEffort <level>` `effort` `section <name>` `sections` `setAvatar <path>` `clearAvatar` `avatar` `caps` `toggleCap <toolsets\|mcp\|skills> <name>` `setYolo <true\|false>` `yolo` |
 | 템플릿 | `templateExport` `lastTemplate` `templateImport <path> <name>` |
 | 대화 | `send <text>` `steer <text>` `queue <text>` `stop` `newChat` `answer <text>` `approve <once\|session\|always\|deny>` `search <text>` `quote <index>` `unread` `notices` |
-| 첨부·파일 | `attachFile <path>` `attachClipboard` `files` `openFile <name>` |
+| 첨부·파일 | `attachFile <path>` `attachClipboard` `files` `openFile <name>` `dropFiles <path,path>` |
 | 음성 | `dictate` `dictateFile <path>` `speakQuiet <text>` `lastSpeech` |
 | History | `sessions` `listed` `openSession <id>` `sessionRename <id> <title>` `sessionArchive <id>` `sessionDelete <id>` |
 | 작업자 | `subagents` `workers` `workerSteer <id> <text>` `workerStop <id>` |
-| Routines | `routines` `routinesView <runsId>` `routineCreate <name> <schedule> <prompt>` `routineRun <id>` `routinePause <id>` `routineResume <id>` `routineDelete <id>` `routineRuns <id>` |
+| Routines | `routines` `routinesAllBots <true\|false>` `routinesShown` `routinesView <runsId>` `routineCreate <name> <schedule> <prompt>` `routineRun <id>` `routinePause <id>` `routineResume <id>` `routineDelete <id>` `routineRuns <id>` |
 | Screen | `screenToggle` `screenInfo` `screenTake` `screenHandback` `screenState` `screenUrl` `demoStart` `demoStop` `demoState` `saveSkillDraft` |
 | 발송 초안 | `draftState` `draftAction <action>` |
 | 그룹 | `groupsView` `groups` `groupCreate <name> <bot,bot>` `groupOpen <id>` `groupSend <text>` `groupDisband <id>` `roomRename <name>` `roomReplyLast` `room` `roomAnswer <once\|deny>` `groupUnread` `showGroup <id>` |
