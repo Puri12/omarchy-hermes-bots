@@ -447,6 +447,35 @@ Panel {
   // What was typed for each bot but not sent; the composer shows the selected bot's.
   property var draftByProfile: ({})
   property string draftOwner: "default"
+  // How many of the shown rows are mine; the prompt jump buttons need two.
+  readonly property int myPromptCount: {
+    var n = 0
+    for (var i = 0; i < shownMessages.length; i++) if (shownMessages[i].role === "you") n++
+    return n
+  }
+  // Scrolls to my previous (-1) or next (1) message from the top of the view. Past the last one, the
+  // chat goes back to following the newest row. Returns the row index, or -1.
+  function jumpPrompt(dir) {
+    var top = chatFlick.contentY
+    var target = -1, targetY = 0
+    for (var i = 0; i < shownMessages.length; i++) {
+      if (shownMessages[i].role !== "you") continue
+      var row = chatRowItems.itemAt(i)
+      if (!row) continue
+      var y = row.y
+      if (dir < 0 ? y < top - 4 && (target < 0 || y > targetY) : y > top + 4 && (target < 0 || y < targetY)) {
+        target = i
+        targetY = y
+      }
+    }
+    if (target < 0) {
+      if (dir > 0) followChat()
+      return -1
+    }
+    chatFlick.contentY = Math.max(0, Math.min(chatFlick.contentHeight - chatFlick.height, targetY - Style.space(4)))
+    return target
+  }
+
   function followChat() {
     chatFlick.following = true
     Qt.callLater(chatFlick.toEnd)
@@ -1776,6 +1805,10 @@ Panel {
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
     // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    function jumpPrompt(dir: int): string {
+      var i = root.jumpPrompt(dir)
+      return JSON.stringify({ row: i, y: Math.round(chatFlick.contentY), text: i >= 0 ? String(root.shownMessages[i].text).slice(0, 60) : "" })
+    }
     function dropFiles(pathsCsv: string): string {
       return String(root.attachDropped(pathsCsv.split(",").map(function(p) { return "file://" + encodeURI(p.trim()) })))
     }
@@ -2026,6 +2059,8 @@ Panel {
       Shortcut { sequence: "Ctrl+K"; enabled: root.shortcutsOn; onActivated: root.toggleSessions() }
       Shortcut { sequence: "Ctrl+F"; enabled: root.shortcutsOn; onActivated: root.toggleSearch() }
       Shortcut { sequence: "Ctrl+Up"; enabled: root.shortcutsOn; onActivated: root.recallLastSent() }
+      Shortcut { sequence: "Alt+Up"; enabled: root.shortcutsOn; onActivated: root.jumpPrompt(-1) }
+      Shortcut { sequence: "Alt+Down"; enabled: root.shortcutsOn; onActivated: root.jumpPrompt(1) }
       Shortcut { sequence: "Alt+1"; enabled: root.shortcutsOn; onActivated: root.selectNth(0) }
       Shortcut { sequence: "Alt+2"; enabled: root.shortcutsOn; onActivated: root.selectNth(1) }
       Shortcut { sequence: "Alt+3"; enabled: root.shortcutsOn; onActivated: root.selectNth(2) }
@@ -3768,6 +3803,7 @@ Panel {
           }
 
           Repeater {
+            id: chatRowItems
             model: chatModel
 
             Rectangle {
@@ -3948,6 +3984,37 @@ Panel {
               }
             }
           }
+        }
+      }
+
+      // Jump between my own messages in a long chat (also Alt+Up / Alt+Down).
+      Column {
+        visible: chatFlick.visible && root.myPromptCount >= 2 && chatFlick.contentHeight > chatFlick.height
+        anchors.right: chatFlick.right
+        anchors.rightMargin: Style.space(14)
+        anchors.bottom: chatFlick.bottom
+        anchors.bottomMargin: Style.space(8)
+        spacing: Style.space(4)
+        opacity: 0.85
+
+        Button {
+          iconText: "󰁝"
+          tooltipText: "My previous message (Alt+Up)"
+          bordered: true
+          foreground: root.dim
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.jumpPrompt(-1)
+        }
+
+        Button {
+          iconText: "󰁅"
+          tooltipText: "My next message (Alt+Down)"
+          bordered: true
+          foreground: root.dim
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.jumpPrompt(1)
         }
       }
 
