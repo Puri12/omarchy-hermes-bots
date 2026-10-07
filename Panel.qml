@@ -897,6 +897,7 @@ Panel {
         pendingFilesByProfile[ev.profile] = (pendingFilesByProfile[ev.profile] || []).concat([{ name: ev.name, local: ev.local, ref: ev.ref }])
       else pendingByProfile[ev.profile] = (pendingByProfile[ev.profile] || []).concat([ev.local])
       revision++
+      Qt.callLater(attachNextDropped)
       break
     case "media":
       addMedia(ev.profile, ev.remote, ev.local, ev.error)
@@ -958,6 +959,7 @@ Panel {
       if (ev.phase === "start") pushMessage(profileForSession(ev.session), "tool", "⚙ " + ev.name + (ev.context ? " " + ev.context : ""))
       break
     case "done":
+      Qt.callLater(attachNextDropped)
       var owner = profileForSession(ev.session)
       var list = transcripts[owner] || []
       var lastRow = list.length > 0 ? list[list.length - 1] : null
@@ -1036,6 +1038,7 @@ Panel {
       lastError = ev.message
       if (skillDraft && skillDraft.saving) skillDraft = Object.assign({}, skillDraft, { saving: false, error: ev.message })
       attaching = false
+      Qt.callLater(attachNextDropped)
       var failed = ev.profile || (ev.session ? profileForSession(ev.session) : selected)
       if (clearingProfiles[failed]) {
         delete clearingProfiles[failed]
@@ -1339,6 +1342,27 @@ Panel {
     // Kept until the helper confirms, so a rejected draft (the server validates it) stays visible with the reason.
     skillDraft = Object.assign({}, skillDraft, { saving: true, error: "" })
     return true
+  }
+
+  // Files dropped on the panel, attached one at a time (the helper takes one attach at a time and
+  // none while the bot replies).
+  property var dropQueue: []
+  function attachDropped(urls) {
+    var paths = []
+    for (var i = 0; i < urls.length; i++) {
+      var u = String(urls[i])
+      if (u.indexOf("file://") === 0) paths.push(decodeURIComponent(u.slice(7)))
+    }
+    if (paths.length === 0) return 0
+    dropQueue = dropQueue.concat(paths)
+    attachNextDropped()
+    return paths.length
+  }
+  function attachNextDropped() {
+    if (dropQueue.length === 0 || attaching || busy) return
+    var next = dropQueue[0]
+    dropQueue = dropQueue.slice(1)
+    attachFrom(next)
   }
 
   function attachFrom(source) {
@@ -1751,6 +1775,10 @@ Panel {
     function routineResume(id: string): string { return root.routineCommand("resume", id) ? "resuming" : "invalid" }
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
+    // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    function dropFiles(pathsCsv: string): string {
+      return String(root.attachDropped(pathsCsv.split(",").map(function(p) { return "file://" + encodeURI(p.trim()) })))
+    }
     function routinesAllBots(on: bool): string {
       if (!root.showingRoutines) root.toggleRoutines()
       root.setRoutinesAll(on)
@@ -1953,6 +1981,36 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+
+      // Files dragged from a file manager onto the panel are attached to the next message.
+      DropArea {
+        id: fileDrop
+        anchors.fill: parent
+        z: 100
+        keys: ["text/uri-list"]
+        onDropped: (drop) => {
+          if (!drop.hasUrls) return
+          root.attachDropped(drop.urls)
+          drop.acceptProposedAction()
+        }
+
+        Rectangle {
+          anchors.fill: parent
+          visible: fileDrop.containsDrag
+          color: root.alpha(Color.accent, 0.12)
+          border.color: Color.accent
+          border.width: 2
+          radius: Style.cornerRadius
+
+          Text {
+            anchors.centerIn: parent
+            text: "Drop to attach to @" + root.selected
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+        }
+      }
       // renameField lives inside the History Repeater and cannot be named here.
       blocked: input.activeFocus || searchField.activeFocus || nameField.activeFocus || descField.activeFocus || root.renamingSession !== ""
         || clarifyField.activeFocus || modelField.activeFocus || attachField.activeFocus
