@@ -1910,6 +1910,19 @@ Panel {
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
     // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    // Global quick message (bound to a Hyprland key): opens the panel on the selected bot with the
+    // composer focused and the chat at its newest row; pressed again while typing, it closes.
+    function quick(): string {
+      if (root.opened && input.activeFocus) {
+        root.close()
+        return "closed"
+      }
+      root.closeDrawers("")
+      if (!root.opened) root.open()
+      root.followChat()
+      Qt.callLater(function() { input.forceActiveFocus() })
+      return "@" + root.selected
+    }
     function setAvatar(path: string): string { return root.setAvatar(path) ? "setting" : "invalid" }
     function clearAvatar(): string { root.sendCommand({ cmd: "avatar.clear", profile: root.selected }); return "clearing" }
     function avatar(): string { return root.selectedAvatar }
