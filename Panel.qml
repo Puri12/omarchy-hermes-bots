@@ -140,6 +140,13 @@ Panel {
   property var unreadProfiles: ({})
   // Server notices (credits, slow start, rate limit / fallback) keyed like Hermes Desktop toasts.
   property var notices: ({})
+  // Bots whose open chat skips approvals (YOLO). Session-scoped on the server: a new chat starts off.
+  property var yoloByProfile: ({})
+  function setYolo(on) {
+    if (!selectedProfile) return false
+    sendCommand({ cmd: "yolo", profile: selected, on: on })
+    return true
+  }
   // Reasoning effort each bot runs with, as the server last reported it.
   property var effortByProfile: ({})
   readonly property var effortLevels: ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -655,6 +662,12 @@ Panel {
     case "session":
       sessionOwner[ev.session] = ev.profile
       break
+    case "yolo":
+      if (ev.on) yoloByProfile[ev.profile] = ev.session
+      else delete yoloByProfile[ev.profile]
+      revision++
+      pushMessage(ev.profile, "tool", ev.on ? "⚠ approvals skipped for this chat (YOLO)" : "approvals back on for this chat")
+      break
     case "effort":
       effortByProfile[ev.profile] = ev.value
       revision++
@@ -696,6 +709,8 @@ Panel {
       if (ev.session) sendCommand({ cmd: "subagents", profile: ev.profile })
       if (ev.session) sessionOwner[ev.session] = ev.profile
       if (ev.replace) {
+        // Another chat was opened; YOLO belonged to the previous one.
+        if (yoloByProfile[ev.profile] !== ev.session) delete yoloByProfile[ev.profile]
         transcripts[ev.profile] = compactTools(tidyHistory(ev.messages))
         pendingByProfile[ev.profile] = []
         pendingFilesByProfile[ev.profile] = []
@@ -936,6 +951,7 @@ Panel {
       break
     case "cleared":
       delete todosByProfile[ev.profile]
+      delete yoloByProfile[ev.profile]
       delete subagentsByProfile[ev.profile]
       var queued = queuedSendByProfile[ev.profile]
       transcripts[ev.profile] = []
@@ -1833,6 +1849,8 @@ Panel {
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
     // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    function setYolo(on: bool): string { return root.setYolo(on) ? "setting" : "invalid" }
+    function yolo(): string { return root.yoloByProfile[root.selected] ? "on" : "off" }
     function artifactsView(): string { root.toggleArtifacts(); return root.showingArtifacts ? "shown" : "hidden" }
     function artifacts(): string { return JSON.stringify(root.artifacts) }
     function jumpPrompt(dir: int): string {
@@ -2245,7 +2263,8 @@ Panel {
               root.revision
               var u = root.usageByProfile[root.selected]
               var effort = root.effortByProfile[root.selected]
-              return (root.selectedProfile ? "model · " + root.selectedProfile.model : "")
+              return (root.yoloByProfile[root.selected] ? "⚠ YOLO  ·  " : "")
+                + (root.selectedProfile ? "model · " + root.selectedProfile.model : "")
                 + (effort ? "  ·  reasoning " + effort : "")
                 + (u ? "  ·  context " + u.contextPercent + "%  ·  " + (u.total >= 1000 ? (u.total / 1000).toFixed(1) + "k" : u.total) + " tokens" : "")
             }
@@ -3650,6 +3669,38 @@ Panel {
                     fontSize: Style.font.caption
                     onClicked: root.setEffort(modelData)
                   }
+                }
+              }
+
+              PanelSectionHeader {
+                text: "APPROVALS · this chat"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Flow {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Button {
+                  text: "Ask me"
+                  selected: { root.revision; return !root.yoloByProfile[root.selected] }
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.setYolo(false)
+                }
+
+                Button {
+                  text: "Skip (YOLO)"
+                  tooltipText: "Run risky commands in this chat without asking. A new chat asks again."
+                  selected: { root.revision; return !!root.yoloByProfile[root.selected] }
+                  bordered: true
+                  foreground: root.urgent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.setYolo(true)
                 }
               }
             }

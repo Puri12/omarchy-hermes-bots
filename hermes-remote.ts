@@ -56,6 +56,7 @@ type Command =
   | { cmd: "clarify"; requestId: string | number; answer: string; questionId?: string }
   | { cmd: "model"; profile: string; provider: string; model: string }
   | { cmd: "effort.get"; profile: string }
+  | { cmd: "yolo"; profile: string; on: boolean }
   | { cmd: "subagents"; profile: string }
   | { cmd: "subagent.steer"; profile: string; id: string; text: string }
   | { cmd: "subagent.stop"; profile: string; id: string }
@@ -1474,6 +1475,19 @@ class Remote {
     this.out({ ev: "effort", profile, value: String(r.value ?? "") });
   }
 
+  // Skip approvals for this chat only (session-scoped YOLO). Without a session the server would flip
+  // a process-wide flag for every bot, so a chat is opened first.
+  async yoloSet(profile: string, on: boolean) {
+    await this.requireProfile(profile);
+    let sid = this.sessionByProfile.get(profile);
+    if (!sid) {
+      await this.load(profile);
+      sid = this.sessionByProfile.get(profile) ?? (await this.newSession(profile));
+    }
+    const r = await this.rpc("config.set", { key: "yolo", value: on ? "on" : "off", session_id: sid });
+    this.out({ ev: "yolo", profile, session: sid, on: String(r.value) === "1" });
+  }
+
   // scope "global" writes agent.reasoning_effort into this bot's config.yaml (the profile param
   // picks whose) and also switches the open chat's agent, so the choice outlives a new chat.
   async effortSet(profile: string, value: string) {
@@ -2180,6 +2194,7 @@ class Remote {
       case "clarify": return this.answerClarify(c.requestId, c.answer, c.questionId);
       case "model": return this.setModel(c.profile, c.provider, c.model);
       case "effort.get": return this.effortGet(c.profile);
+      case "yolo": return this.yoloSet(c.profile, c.on);
       case "subagents": return this.subagentList(c.profile);
       case "subagent.steer": return this.subagentSteer(c.profile, c.id, c.text);
       case "subagent.stop": return this.subagentStop(c.profile, c.id);
