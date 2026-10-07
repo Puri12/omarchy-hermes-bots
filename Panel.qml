@@ -304,7 +304,21 @@ Panel {
     sendCommand({ cmd: "load", profile: profile })
   }
 
+  // What was typed for each bot but not sent; the composer shows the selected bot's.
+  property var draftByProfile: ({})
+  property string draftOwner: "default"
+  function followChat() {
+    chatFlick.following = true
+    Qt.callLater(chatFlick.toEnd)
+  }
+
   onSelectedChanged: {
+    // A bot that was just removed has no draft to keep.
+    if (draftOwner === "default" || profiles.some(function(p) { return p.name === draftOwner })) draftByProfile[draftOwner] = input.text
+    draftOwner = selected
+    input.text = draftByProfile[selected] || ""
+    input.cursorPosition = input.text.length
+    followChat()
     searching = false
     searchText = ""
     quoteText = ""
@@ -886,6 +900,7 @@ Panel {
 
   // The helper prepends the pending @file: refs to the prompt; the bubble lists the files as chips.
   function sendTextForProfile(profile, text, images, files) {
+    if (profile === selected) followChat()
     if (text === "") text = images.length > 0 ? "(image)" : "(file)"
     lastSentByProfile[profile] = text
     pushMessage(profile, "you", text, images, (files || []).map(function(f) { return { name: f.name, local: f.local } }))
@@ -1297,6 +1312,7 @@ Panel {
   function forgetBot(name) {
     delete transcripts[name]
     delete busyProfiles[name]
+    delete draftByProfile[name]
     if (selected === name) selected = "default"
     if (armedDelete === name) armedDelete = ""
     revision++
@@ -1471,6 +1487,13 @@ Panel {
     }
     function skillSave(name: string, content: string): string { return root.saveSkill(name, content) ? "saving" : "invalid" }
     // Test hook: sets the composer text and returns the suggestion names it now shows.
+    // Test hook: move the chat to a fraction of its scroll range (0 top, 1 bottom) and report it.
+    function chatScroll(fraction: real): string {
+      var max = Math.max(0, chatFlick.contentHeight - chatFlick.height)
+      if (fraction >= 0) chatFlick.contentY = Math.round(max * Math.min(1, fraction))
+      return JSON.stringify({ y: Math.round(chatFlick.contentY), max: Math.round(max), following: chatFlick.following,
+        composer: input.text })
+    }
     function setComposer(text: string): string {
       input.text = text
       return JSON.stringify(root.skillMatches.map(function(s) { return s.name }))
@@ -3204,9 +3227,14 @@ Panel {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-        onContentHeightChanged: contentY = Math.max(0, contentHeight - height)
+        // Follows the newest row only while the view sits at the bottom, so scrolling up to read
+        // stays put while a reply streams in. root.followChat() turns it back on.
+        property bool following: true
+        function toEnd() { contentY = Math.max(0, contentHeight - height) }
+        onContentYChanged: following = contentY >= contentHeight - height - 2
+        onContentHeightChanged: if (following) toEnd()
         // The footer (todo list, cards) grows and shrinks the chat; keep the newest row in view.
-        onHeightChanged: contentY = Math.max(0, contentHeight - height)
+        onHeightChanged: if (following) toEnd()
 
         Column {
           id: chatColumn
