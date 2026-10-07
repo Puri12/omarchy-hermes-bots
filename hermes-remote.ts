@@ -415,18 +415,49 @@ function roomRow(e: Json): Json | null {
 
 const credPath = `${process.env.HOME}/.config/hermes-remote/credentials.env`;
 
-async function loadCredentials() {
+// A server is reached with a login (user + password) or with its fixed session token.
+type Creds = { url: string; user?: string; password?: string; token?: string };
+type ExtraServer = { id: string; label: string; creds: Creds };
+
+const parseEnv = (text: string): Record<string, string> => Object.fromEntries(
+  text.split("\n").filter((l) => l.includes("=") && !l.trimStart().startsWith("#")).map((l) => {
+    const i = l.indexOf("=");
+    return [l.slice(0, i).trim(), l.slice(i + 1).trim()];
+  }));
+
+async function loadCredentials(): Promise<Creds> {
   const file = Bun.file(credPath);
   if (!(await file.exists())) throw new RemoteError(`missing ${credPath}`);
-  const env = Object.fromEntries(
-    (await file.text()).split("\n").filter((l) => l.includes("=")).map((l) => {
-      const i = l.indexOf("=");
-      return [l.slice(0, i).trim(), l.slice(i + 1).trim()];
-    }),
-  );
-  const { HERMES_REMOTE_URL: url, HERMES_REMOTE_USER: user, HERMES_REMOTE_PASSWORD: password } = env;
+  const { HERMES_REMOTE_URL: url, HERMES_REMOTE_USER: user, HERMES_REMOTE_PASSWORD: password } = parseEnv(await file.text());
   if (!url || !user || !password) throw new RemoteError("credentials.env is incomplete");
   return { url: url.replace(/\/$/, ""), user, password };
+}
+
+// More servers whose bots sit in the same roster. Optional file, a JSON list:
+//   [{ "id": "laptop", "label": "Laptop", "url": "http://127.0.0.1:9119", "envFile": "~/.config/hermes-remote/laptop.env" }]
+// envFile holds HERMES_DASHBOARD_SESSION_TOKEN, or HERMES_REMOTE_USER and HERMES_REMOTE_PASSWORD; no secret is copied here.
+const serversPath = `${process.env.HOME}/.config/hermes-remote/servers.json`;
+
+async function loadExtraServers(): Promise<ExtraServer[]> {
+  const file = Bun.file(serversPath);
+  if (!(await file.exists())) return [];
+  let raw: unknown;
+  try { raw = JSON.parse(await file.text()); } catch { throw new RemoteError(`${serversPath} is not valid JSON`); }
+  const found: ExtraServer[] = [];
+  for (const s of Array.isArray(raw) ? (raw as Json[]) : []) {
+    const id = String(s.id ?? "").trim().toLowerCase();
+    const url = String(s.url ?? "").trim().replace(/\/$/, "");
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(id) || !/^https?:\/\//.test(url) || found.some((x) => x.id === id))
+      throw new RemoteError(`${serversPath}: every server needs its own id (letters, digits, - or _) and an http(s) url`);
+    const envPath = String(s.envFile ?? "").replace(/^~(?=\/)/, process.env.HOME ?? "");
+    const envFile = Bun.file(envPath || "/nonexistent");
+    const env = (await envFile.exists()) ? parseEnv(await envFile.text()) : {};
+    const { HERMES_DASHBOARD_SESSION_TOKEN: token, HERMES_REMOTE_USER: user, HERMES_REMOTE_PASSWORD: password } = env;
+    if (!token && !(user && password))
+      throw new RemoteError(`${serversPath}: ${id} needs an envFile with HERMES_DASHBOARD_SESSION_TOKEN, or with HERMES_REMOTE_USER and HERMES_REMOTE_PASSWORD`);
+    found.push({ id, label: String(s.label ?? id).trim() || id, creds: { url, user, password, token } });
+  }
+  return found;
 }
 
 // In daemon mode this becomes a broadcast to every connected panel.
@@ -441,9 +472,19 @@ class Remote {
   private replyBySession = new Map<string, string>();
   private knownProfiles = new Set<string>(["default"]);
 
-  constructor(private creds: { url: string; user: string; password: string }) {}
+  constructor(private creds: Creds) {}
+
+  // Where this server's events go. The hub replaces it to merge several servers into one roster.
+  out: (ev: Json) => void = (ev) => emit(ev);
+  // The roster name of one of this server's bots (differs from its own name on an extra server).
+  alias: (profile: string) => string = (profile) => profile;
+
+  private auth(): Record<string, string> {
+    return this.creds.token ? { "X-Hermes-Session-Token": this.creds.token } : { Cookie: this.cookie };
+  }
 
   private async login() {
+    if (this.creds.token) return;
     const r = await fetch(`${this.creds.url}/auth/password-login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -458,7 +499,7 @@ class Remote {
     if (!this.cookie) await this.login();
     const r = await fetch(`${this.creds.url}${path}`, {
       ...init,
-      headers: { "Content-Type": "application/json", Cookie: this.cookie, ...(init.headers ?? {}) },
+      headers: { "Content-Type": "application/json", ...this.auth(), ...(init.headers ?? {}) },
       signal: AbortSignal.timeout(45000),
     });
     if (r.status === 401 && !retried) {
@@ -471,7 +512,8 @@ class Remote {
   }
 
   async status() {
-    const s = await (await fetch(`${this.creds.url}/api/status`, { signal: AbortSignal.timeout(10000) })).json() as Json;
+    const s = await (await fetch(`${this.creds.url}/api/status`,
+      { headers: this.creds.token ? this.auth() : {}, signal: AbortSignal.timeout(10000) })).json() as Json;
     const p = await this.api("/api/profiles");
     // Pin/hide live in ui_meta, which only the gateway RPC returns; the roster still works without it.
     const meta = await this.botMeta().catch(() => new Map<string, { meta: Json; rev: number }>());
@@ -493,8 +535,9 @@ class Remote {
 
   private async socket(): Promise<WebSocket> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return this.ws;
-    const { ticket } = (await this.api("/api/auth/ws-ticket", { method: "POST" })) as { ticket: string };
-    const ws = new WebSocket(`${this.creds.url.replace(/^http/, "ws")}/api/ws?ticket=${encodeURIComponent(ticket)}`);
+    const key = this.creds.token ? `token=${encodeURIComponent(this.creds.token)}`
+      : `ticket=${encodeURIComponent(((await this.api("/api/auth/ws-ticket", { method: "POST" })) as { ticket: string }).ticket)}`;
+    const ws = new WebSocket(`${this.creds.url.replace(/^http/, "ws")}/api/ws?${key}`);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new RemoteError("websocket ready timeout")), 20000);
       ws.onmessage = (e) => {
@@ -517,7 +560,7 @@ class Remote {
         this.pending.clear();
         // viewer_id is only honored on the gateway connection that minted it.
         this.viewerByProfile.clear();
-        emit({ ev: "disconnected", code: e.code });
+        this.out({ ev: "disconnected", code: e.code });
       };
     });
     this.ws = ws;
@@ -551,38 +594,38 @@ class Remote {
     switch (p.type) {
       case "message.start":
         this.replyBySession.set(sid, "");
-        emit({ ev: "start", session: sid });
-        emit({ ev: "activity", session: sid, text: "thinking" });
+        this.out({ ev: "start", session: sid });
+        this.out({ ev: "activity", session: sid, text: "thinking" });
         break;
       case "message.delta": {
         const text = String(payload.text ?? "");
         this.replyBySession.set(sid, (this.replyBySession.get(sid) ?? "") + text);
-        emit({ ev: "delta", session: sid, text });
+        this.out({ ev: "delta", session: sid, text });
         break;
       }
       case "thinking.delta":
       case "reasoning.delta":
-        if (String(payload.text ?? "").trim()) emit({ ev: "activity", session: sid, text: "thinking" });
+        if (String(payload.text ?? "").trim()) this.out({ ev: "activity", session: sid, text: "thinking" });
         break;
       case "tool.generating":
-        emit({ ev: "activity", session: sid, text: `preparing ${String(payload.name ?? "tool")}` });
+        this.out({ ev: "activity", session: sid, text: `preparing ${String(payload.name ?? "tool")}` });
         break;
       case "status.update": {
         const text = String(payload.text ?? "").trim();
-        if (text) emit({ ev: "activity", session: sid, text });
+        if (text) this.out({ ev: "activity", session: sid, text });
         // Rate-limit warnings and model fallbacks are worth a banner, not just a status line.
         const kind = String(payload.kind ?? "");
         if (text && (kind === "warn" || kind === "fallback"))
-          emit({ ev: "notice", key: `status.${kind}`, level: "warn", kind: "ttl", ttl_ms: 15000, text });
+          this.out({ ev: "notice", key: `status.${kind}`, level: "warn", kind: "ttl", ttl_ms: 15000, text });
         break;
       }
       case "notification.show":
         if (String(payload.text ?? "").trim())
-          emit({ ev: "notice", key: String(payload.key || payload.id || payload.text), level: String(payload.level ?? "info"),
+          this.out({ ev: "notice", key: String(payload.key || payload.id || payload.text), level: String(payload.level ?? "info"),
             kind: String(payload.kind ?? "sticky"), ttl_ms: Number(payload.ttl_ms ?? 0), text: String(payload.text).trim() });
         break;
       case "notification.clear":
-        emit({ ev: "notice_clear", key: String(payload.key ?? "") });
+        this.out({ ev: "notice_clear", key: String(payload.key ?? "") });
         break;
       // delegate_task children report on the parent's sid; the child's own text stream is not forwarded.
       case "subagent.start":
@@ -590,7 +633,7 @@ class Remote {
       case "subagent.progress":
       case "subagent.complete": {
         const phase = p.type === "subagent.start" ? "start" : p.type === "subagent.complete" ? "done" : "tool";
-        emit({ ev: "subagent", session: sid, phase, id: String(payload.subagent_id ?? payload.delegation_id ?? ""),
+        this.out({ ev: "subagent", session: sid, phase, id: String(payload.subagent_id ?? payload.delegation_id ?? ""),
           goal: String(payload.goal ?? "").slice(0, 160),
           tool: String(payload.tool_preview ?? payload.tool_name ?? payload.text ?? "").replace(/\s+/g, " ").slice(0, 80),
           count: Number(payload.tool_count ?? 0), status: String(payload.status ?? ""),
@@ -599,12 +642,12 @@ class Remote {
       }
       case "session.usage": {
         const u = (payload.usage as Json) ?? {};
-        emit({ ev: "usage", session: sid, total: Number(u.total ?? 0), contextPercent: Number(u.context_percent ?? 0) });
+        this.out({ ev: "usage", session: sid, total: Number(u.total ?? 0), contextPercent: Number(u.context_percent ?? 0) });
         break;
       }
       case "todo.updated":
         // Full snapshot of the bot's own task list; the panel shows it while the bot works.
-        emit({ ev: "todos", session: sid, todos: ((payload.todos as Json[]) ?? []).map((t) => ({
+        this.out({ ev: "todos", session: sid, todos: ((payload.todos as Json[]) ?? []).map((t) => ({
           text: String(t.content ?? t.text ?? t.title ?? ""), status: String(t.status ?? "pending") })) });
         break;
       case "tool.start":
@@ -612,24 +655,24 @@ class Remote {
         const name = String(payload.name ?? payload.tool_name ?? payload.tool ?? "tool");
         const context = String(payload.context ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
         const phase = p.type === "tool.start" ? "start" : "done";
-        emit({ ev: "tool", session: sid, phase, name, context });
-        emit({ ev: "activity", session: sid, text: phase === "start" ? `${name}${context ? ` ${context}` : ""}` : "thinking" });
+        this.out({ ev: "tool", session: sid, phase, name, context });
+        this.out({ ev: "activity", session: sid, text: phase === "start" ? `${name}${context ? ` ${context}` : ""}` : "thinking" });
         break;
       }
       case "message.complete":
       {
         const text = String(payload.text ?? this.replyBySession.get(sid) ?? "");
-        emit({ ev: "done", session: sid, text });
+        this.out({ ev: "done", session: sid, text });
         void this.fetchMedia(sid, this.profileOf(sid), text);
         break;
       }
       case "error":
-        emit({ ev: "error", session: sid, message: String(payload.message ?? p.message ?? "error") });
+        this.out({ ev: "error", session: sid, message: String(payload.message ?? p.message ?? "error") });
         break;
       case "request.cancel":
         // A question/approval expired or was withdrawn server-side; the panel must drop its card.
         this.batchClarify.delete(String(payload.id ?? ""));
-        emit({ ev: "request.cancel", session: sid, requestId: payload.id, method: String(payload.method ?? ""),
+        this.out({ ev: "request.cancel", session: sid, requestId: payload.id, method: String(payload.method ?? ""),
           reason: String(payload.reason ?? "") });
         break;
       case "display.lease":
@@ -655,7 +698,7 @@ class Remote {
           choices: (q.choices as string[]) ?? [] }))
         : [{ qid: "", question: String(params.question ?? ""), choices: (params.choices as string[]) ?? [] }];
       this.batchClarify.set(String(id), batch);
-      emit({ ev: "clarify", requestId: id, session: String(params.session_id ?? ""), batch, questions });
+      this.out({ ev: "clarify", requestId: id, session: String(params.session_id ?? ""), batch, questions });
       return;
     }
     if (method !== "approval") {
@@ -664,10 +707,10 @@ class Remote {
     }
     if (this.autoApprove) {
       this.reply(id, { result: { choice: this.autoApprove } });
-      emit({ ev: "approval.auto", requestId: id, choice: this.autoApprove });
+      this.out({ ev: "approval.auto", requestId: id, choice: this.autoApprove });
       return;
     }
-    emit({ ev: "approval", requestId: id, session: String(params.session_id ?? ""),
+    this.out({ ev: "approval", requestId: id, session: String(params.session_id ?? ""),
       command: String(params.command ?? params.action ?? ""), description: String(params.description ?? ""),
       choices: (params.choices as string[]) ?? ["once", "deny"] });
   }
@@ -704,7 +747,7 @@ class Remote {
     // holds; resuming its stored key reattaches the live session and returns its messages.
     const live = this.sessionByProfile.get(profile);
     const key = live ? this.keyByProfile.get(profile) : undefined;
-    if (live && !key) return emit({ ev: "history", profile, session: live, messages: [] });
+    if (live && !key) return this.out({ ev: "history", profile, session: live, messages: [] });
     let stored = key ?? "";
     let title = "";
     if (!key) {
@@ -712,7 +755,7 @@ class Remote {
       stored = recent.session_id ? String(recent.session_id) : "";
       title = String(recent.title ?? "");
       if (!stored) {
-        emit({ ev: "history", profile, session: "", messages: [] });
+        this.out({ ev: "history", profile, session: "", messages: [] });
         return;
       }
     }
@@ -721,7 +764,7 @@ class Remote {
       r = await this.rpc("session.resume", { session_id: stored, cols: 100, ...this.profileParam(profile) });
     } catch (e) {
       // A fresh chat has no stored row until its first turn.
-      if (live) return emit({ ev: "history", profile, session: live, messages: [] });
+      if (live) return this.out({ ev: "history", profile, session: live, messages: [] });
       throw e;
     }
     const sid = String(r.session_id);
@@ -729,7 +772,7 @@ class Remote {
     this.keyByProfile.set(profile, stored);
     if (!key) this.storedByProfile.set(profile, stored);
     const messages = ((r.messages as Json[]) ?? []).map(historyRow).filter((x): x is HistoryRow => x !== null);
-    emit({ ev: "history", profile, session: sid, title, messages });
+    this.out({ ev: "history", profile, session: sid, title, messages });
     for (const m of messages) if (m.role === "bot") void this.fetchMedia(sid, profile, m.text);
   }
 
@@ -758,7 +801,7 @@ class Remote {
     if (!this.cookie) await this.login();
     const scope = profile !== "default" ? `&profile=${encodeURIComponent(profile)}` : "";
     const get = () => fetch(`${this.creds.url}/api/fs/download?path=${encodeURIComponent(remote)}${scope}`,
-      { headers: { Cookie: this.cookie }, signal: AbortSignal.timeout(120000) });
+      { headers: this.auth(), signal: AbortSignal.timeout(120000) });
     let r = await get();
     if (r.status === 401) {
       await this.login();
@@ -792,7 +835,7 @@ class Remote {
     for (const match of text.replace(CODE_SPAN_RE, (s) => " ".repeat(s.length)).matchAll(BARE_PATH_RE)) add(match[0], false);
     for (const { remote, tagged } of refs) {
       // A bare path may be prose or a file that was never written; like Hermes, skip it silently if absent.
-      const report = (ev: Json) => { if (tagged || !ev.error) emit(ev); };
+      const report = (ev: Json) => { if (tagged || !ev.error) this.out(ev); };
       if (!IMAGE_PATH_RE.test(remote)) {
         const name = remote.split("/").pop() || remote;
         try {
@@ -821,7 +864,7 @@ class Remote {
       const local = await saveCache("outgoing", src.bytes, ext);
       await this.rpc("image.attach_bytes", {
         session_id: sid, content_base64: Buffer.from(src.bytes).toString("base64"), filename: src.name });
-      return emit({ ev: "attached", kind: "image", profile, session: sid, local, name: src.name });
+      return this.out({ ev: "attached", kind: "image", profile, session: sid, local, name: src.name });
     }
     // file.attach only stages the bytes; the agent sees the file through the @file: ref in the prompt.
     const r = await this.rpc("file.attach", { session_id: sid, name: src.name, ...this.profileParam(profile),
@@ -829,7 +872,7 @@ class Remote {
     const ref = String(r.ref_text || (r.ref_path ? `@file:${r.ref_path}` : ""));
     if (!ref) throw new RemoteError(`file.attach returned no ref for ${src.name}`);
     this.pendingRefs.set(profile, [...(this.pendingRefs.get(profile) ?? []), ref]);
-    emit({ ev: "attached", kind: "file", profile, session: sid, name: String(r.name || src.name), ref, local: src.path });
+    this.out({ ev: "attached", kind: "file", profile, session: sid, name: String(r.name || src.name), ref, local: src.path });
   }
 
   private pendingRefs = new Map<string, string[]>();
@@ -842,7 +885,7 @@ class Remote {
     this.keyByProfile.set(profile, String(r.stored_session_id ?? ""));
     this.storedByProfile.delete(profile);
     this.pendingRefs.delete(profile);
-    emit({ ev: "session", profile, session: sid, model: (r.info as Json | undefined)?.model ?? "" });
+    this.out({ ev: "session", profile, session: sid, model: (r.info as Json | undefined)?.model ?? "" });
     return sid;
   }
 
@@ -850,7 +893,7 @@ class Remote {
     await this.requireProfile(profile);
     if (!this.sessionByProfile.has(profile)) await this.load(profile);
     const sid = this.sessionByProfile.get(profile) ?? (await this.newSession(profile));
-    emit({ ev: "sent", profile, session: sid });
+    this.out({ ev: "sent", profile, session: sid });
     const refs = this.pendingRefs.get(profile) ?? [];
     this.pendingRefs.delete(profile);
     let prompt = text;
@@ -860,7 +903,7 @@ class Remote {
     if (slash && (await this.isSkill(profile, slash[1]))) {
       const r = await this.rpc("command.dispatch", { session_id: sid, name: slash[1], arg: slash[2] ?? "", ...this.profileParam(profile) });
       if (r.type === "skill" && r.message) {
-        emit({ ev: "skillShown", profile, session: sid, display: String(r.display || text) });
+        this.out({ ev: "skillShown", profile, session: sid, display: String(r.display || text) });
         prompt = String(r.message);
       }
     }
@@ -877,7 +920,7 @@ class Remote {
       category: String(s.category ?? ""), enabled: s.enabled !== false,
     })).filter((s) => s.name);
     this.skillsByProfile.set(profile, skills);
-    emit({ ev: "skills", profile, skills });
+    this.out({ ev: "skills", profile, skills });
     return skills;
   }
 
@@ -892,7 +935,7 @@ class Remote {
     await this.requireProfile(profile);
     await this.api("/api/skills", { method: "POST",
       body: JSON.stringify({ name, content, profile, ...(category ? { category } : {}) }) });
-    emit({ ev: "skillSaved", profile, name });
+    this.out({ ev: "skillSaved", profile, name });
     // The server caches its skill scan for ~30 s, so a fresh save may be missing from this first list.
     await this.skills(profile);
   }
@@ -907,11 +950,11 @@ class Remote {
       const r = sid ? await this.rpc("session.steer", { session_id: sid, text }) : { status: "rejected" };
       if (r.status === "rejected") {
         await this.send(profile, text);
-        return emit({ ev: "steered", profile, session: this.sessionByProfile.get(profile), status: "sent", text });
+        return this.out({ ev: "steered", profile, session: this.sessionByProfile.get(profile), status: "sent", text });
       }
-      emit({ ev: "steered", profile, session: sid, status: String(r.status), text });
+      this.out({ ev: "steered", profile, session: sid, status: String(r.status), text });
     } catch (e) {
-      emit({ ev: "steered", profile, session: sid, text, error: e instanceof Error ? e.message : String(e) });
+      this.out({ ev: "steered", profile, session: sid, text, error: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -923,9 +966,9 @@ class Remote {
     const sid = this.sessionByProfile.get(profile) ?? (await this.newSession(profile));
     try {
       const r = await this.rpc("prompt.submit", { session_id: sid, text, queued: true });
-      emit({ ev: "queued", profile, session: sid, status: r.status === "streaming" ? "sent" : String(r.status), text });
+      this.out({ ev: "queued", profile, session: sid, status: r.status === "streaming" ? "sent" : String(r.status), text });
     } catch (e) {
-      emit({ ev: "queued", profile, session: sid, text, error: e instanceof Error ? e.message : String(e) });
+      this.out({ ev: "queued", profile, session: sid, text, error: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -941,7 +984,7 @@ class Remote {
     if (!sid) return;
     const r = await this.rpc("subagent.list", { session_id: sid });
     const rows = Array.isArray(r.subagents) ? (r.subagents as Json[]) : [];
-    emit({ ev: "subagents", profile, list: rows.filter((s) => s.subagent_id).map((s) => ({
+    this.out({ ev: "subagents", profile, list: rows.filter((s) => s.subagent_id).map((s) => ({
       id: String(s.subagent_id), goal: String(s.goal ?? "").slice(0, 160), tool: String(s.last_tool ?? "").slice(0, 80),
       count: Number(s.tool_count ?? 0), startedAt: Math.round(Number(s.started_at ?? 0) * 1000) })) });
   }
@@ -951,16 +994,16 @@ class Remote {
     const sid = this.sessionByProfile.get(profile);
     try {
       const r = sid ? await this.rpc("subagent.steer", { session_id: sid, subagent_id: id, text }) : { status: "rejected" };
-      emit({ ev: "subagent.steered", profile, id, status: String(r.status), text });
+      this.out({ ev: "subagent.steered", profile, id, status: String(r.status), text });
     } catch (e) {
-      emit({ ev: "subagent.steered", profile, id, text, error: e instanceof Error ? e.message : String(e) });
+      this.out({ ev: "subagent.steered", profile, id, text, error: e instanceof Error ? e.message : String(e) });
     }
   }
 
   async subagentStop(profile: string, id: string) {
     const sid = this.sessionByProfile.get(profile);
     const r = sid ? await this.rpc("subagent.interrupt", { session_id: sid, subagent_id: id }) : { found: false };
-    emit({ ev: "subagent.stopped", profile, id, found: r.found === true });
+    this.out({ ev: "subagent.stopped", profile, id, found: r.found === true });
   }
 
   async listSessions(profile: string) {
@@ -971,7 +1014,7 @@ class Remote {
       source: String(s.source ?? ""), startedAt: Number(s.started_at ?? 0), messages: Number(s.message_count ?? 0),
       current: String(s.resolved_id ?? s.id) === this.storedByProfile.get(profile),
     }));
-    emit({ ev: "sessions", profile, sessions });
+    this.out({ ev: "sessions", profile, sessions });
   }
 
   // REST PATCH/DELETE /api/sessions/{id} (the dashboard's own calls); the list is re-read afterwards.
@@ -1024,7 +1067,7 @@ class Remote {
     mkdirSync(dir, { recursive: true });
     const path = `${dir}/hermes-bot-${profile}.json`;
     await Bun.write(path, JSON.stringify(template, null, 2));
-    emit({ ev: "template.exported", profile, path, skills: skills.length, routines: routines.length });
+    this.out({ ev: "template.exported", profile, path, skills: skills.length, routines: routines.length });
   }
 
   async templateImport(rawPath: string, name: string) {
@@ -1042,7 +1085,7 @@ class Remote {
     if (t.model) await this.setModel(bot, String(t.provider || "custom"), String(t.model));
     for (const s of (t.skills as Json[]) ?? []) await this.skillSave(bot, String(s.name), String(s.content), String(s.category || "") || undefined);
     for (const r of (t.routines as Json[]) ?? []) await this.routineCreate(bot, String(r.name), String(r.schedule), String(r.prompt ?? ""));
-    emit({ ev: "template.imported", profile: bot, skills: ((t.skills as Json[]) ?? []).length, routines: ((t.routines as Json[]) ?? []).length });
+    this.out({ ev: "template.imported", profile: bot, skills: ((t.skills as Json[]) ?? []).length, routines: ((t.routines as Json[]) ?? []).length });
   }
 
   // Voice. Speech is synthesised on the server (POST /api/audio/speak) and played locally with pw-play;
@@ -1060,7 +1103,7 @@ class Remote {
     const mime = String(r.mime_type ?? "audio/mpeg");
     const local = await saveCache("audio", decodeDataUrl(String(r.data_url ?? "")),
       mime.includes("wav") ? ".wav" : mime.includes("ogg") ? ".ogg" : ".mp3");
-    emit({ ev: "speech", profile, local, playing: play });
+    this.out({ ev: "speech", profile, local, playing: play });
     if (!play) return;
     this.player?.kill();
     const player = Bun.spawn(["pw-play", local], { stdout: "ignore", stderr: "pipe" });
@@ -1068,7 +1111,7 @@ class Remote {
     const code = await player.exited;
     if (this.player === player) this.player = null;
     if (code !== 0 && !player.killed) throw new RemoteError(`could not play audio (pw-play exit ${code})`);
-    emit({ ev: "speech.done", profile });
+    this.out({ ev: "speech.done", profile });
   }
 
   stopSpeech() {
@@ -1082,7 +1125,7 @@ class Remote {
     this.recordPath = `${cacheDir}/audio/dictation-${Date.now()}.wav`;
     this.recorder = Bun.spawn(["pw-record", "--rate", "16000", "--channels", "1", this.recordPath],
       { stdout: "ignore", stderr: "ignore" });
-    emit({ ev: "dictation", recording: true });
+    this.out({ ev: "dictation", recording: true });
   }
 
   async dictateStop(profile: string) {
@@ -1091,7 +1134,7 @@ class Remote {
     this.recorder = null;
     recorder.kill("SIGINT");
     await recorder.exited;
-    emit({ ev: "dictation", recording: false });
+    this.out({ ev: "dictation", recording: false });
     try {
       await this.transcribe(profile, this.recordPath);
     } finally {
@@ -1107,7 +1150,7 @@ class Remote {
     const dataUrl = `data:${mime};base64,${Buffer.from(await file.arrayBuffer()).toString("base64")}`;
     const r = await this.api(`/api/audio/transcribe?profile=${encodeURIComponent(profile)}`, {
       method: "POST", body: JSON.stringify({ data_url: dataUrl, mime_type: mime }) });
-    emit({ ev: "transcript", profile, text: String(r.transcript ?? "").trim() });
+    this.out({ ev: "transcript", profile, text: String(r.transcript ?? "").trim() });
   }
 
   async reconnect() {
@@ -1120,7 +1163,7 @@ class Remote {
         ws.close();
       });
     }
-    emit(await this.status());
+    this.out(await this.status());
   }
 
   async openSession(profile: string, session: string) {
@@ -1132,7 +1175,7 @@ class Remote {
     this.storedByProfile.set(profile, session);
     this.pendingRefs.delete(profile);
     const messages = ((r.messages as Json[]) ?? []).map(historyRow).filter((x): x is HistoryRow => x !== null);
-    emit({ ev: "history", profile, session: sid, replace: true, messages });
+    this.out({ ev: "history", profile, session: sid, replace: true, messages });
     for (const m of messages) if (m.role === "bot") void this.fetchMedia(sid, profile, m.text);
   }
 
@@ -1169,7 +1212,7 @@ class Remote {
       if (running !== this.cronRunning.has(id)) {
         if (running) this.cronRunning.add(id);
         else this.cronRunning.delete(id);
-        emit({ ev: "cron.running", profile, job: name, running });
+        this.out({ ev: "cron.running", profile, job: name, running });
       }
       const last = String(job.last_run_at ?? "");
       if (!last) continue;
@@ -1185,7 +1228,7 @@ class Remote {
       const failed = String(job.last_status ?? "ok") !== "ok";
       // Nothing new ([SILENT] or no agent run) is not worth a toast; failures always are.
       if (!failed && (report.text === "" || report.text === "[SILENT]")) continue;
-      emit({ ev: "cron", profile, job: name, at: last, status: String(job.last_status ?? ""),
+      this.out({ ev: "cron", profile, job: name, at: last, status: String(job.last_status ?? ""),
         error: String(job.last_error ?? ""), session: report.session, text: report.text, notify: owner });
     }
   }
@@ -1194,7 +1237,7 @@ class Remote {
   async routines(profile: string) {
     await this.requireProfile(profile);
     const jobs = (await this.api(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`)) as unknown as Json[];
-    emit({ ev: "routines", profile, jobs: (Array.isArray(jobs) ? jobs : []).map((j) => ({
+    this.out({ ev: "routines", profile, jobs: (Array.isArray(jobs) ? jobs : []).map((j) => ({
       id: String(j.id ?? ""), name: String(j.name || j.id || ""), schedule_display: String(j.schedule_display ?? ""),
       enabled: j.enabled !== false, state: String(j.state ?? ""), next_run_at: j.next_run_at ?? null,
       last_run_at: j.last_run_at ?? null, last_status: j.last_status ?? null, last_error: j.last_error ?? null,
@@ -1207,7 +1250,7 @@ class Remote {
     await this.requireProfile(profile);
     const job = await this.api(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`, {
       method: "POST", body: JSON.stringify({ name, schedule, prompt, deliver: "local" }) });
-    emit({ ev: "routine", profile, action: "created", id: String(job.id ?? "") });
+    this.out({ ev: "routine", profile, action: "created", id: String(job.id ?? "") });
     await this.routines(profile);
   }
 
@@ -1218,14 +1261,14 @@ class Remote {
     const scope = `?profile=${encodeURIComponent(profile)}`;
     if (action === "delete") await this.api(path + scope, { method: "DELETE" });
     else await this.api(`${path}/${action === "run" ? "trigger" : action}${scope}`, { method: "POST" });
-    emit({ ev: "routine", profile, action, id });
+    this.out({ ev: "routine", profile, action, id });
     await this.routines(profile);
   }
 
   async routineRuns(profile: string, id: string) {
     await this.requireProfile(profile);
     const r = await this.api(`/api/cron/jobs/${encodeURIComponent(id)}/runs?profile=${encodeURIComponent(profile)}&limit=10`);
-    emit({ ev: "routine.runs", profile, id, runs: ((r.runs as Json[]) ?? []).map((x) => ({
+    this.out({ ev: "routine.runs", profile, id, runs: ((r.runs as Json[]) ?? []).map((x) => ({
       id: String(x.id ?? ""), started_at: x.started_at ?? null, ended_at: x.ended_at ?? null,
       end_reason: x.end_reason ?? null, title: String(x.title || x.preview || ""),
     })) });
@@ -1233,13 +1276,13 @@ class Remote {
 
   // A trigger can take a while; keep the NDJSON loop free and report failures against the bot.
   private routineCommand(profile: string, run: () => Promise<unknown>) {
-    void run().catch((e) => emit({ ev: "error", profile, message: e instanceof Error ? e.message : String(e) }));
+    void run().catch((e) => this.out({ ev: "error", profile, message: e instanceof Error ? e.message : String(e) }));
   }
 
   async create(name: string, description = "") {
     await this.api("/api/profiles", { method: "POST", body: JSON.stringify({ name, description, clone_from: "default" }) });
-    emit({ ev: "created", name });
-    emit(await this.status());
+    this.out({ ev: "created", name });
+    this.out(await this.status());
   }
 
   // Hermes Bot Mode keeps roster flags in ui_meta["hermes-bots"], guarded by a per-namespace revision.
@@ -1256,7 +1299,7 @@ class Remote {
     const row = (((await this.api("/api/profiles")).profiles as Json[]) ?? []).find((x) => x.name === profile);
     const soul = await this.api(`/api/profiles/${encodeURIComponent(profile)}/soul`);
     const meta = (await this.botMeta().catch(() => null))?.get(profile)?.meta ?? {};
-    emit({ ev: "profile", profile, description: String(row?.description ?? ""), soul: String(soul.content ?? ""),
+    this.out({ ev: "profile", profile, description: String(row?.description ?? ""), soul: String(soul.content ?? ""),
       pinned: meta.pinned === true, hidden: meta.hidden === true });
   }
 
@@ -1266,8 +1309,8 @@ class Remote {
     if (typeof description === "string")
       await this.api(`${base}/description`, { method: "PUT", body: JSON.stringify({ description }) });
     if (typeof soul === "string") await this.api(`${base}/soul`, { method: "PUT", body: JSON.stringify({ content: soul }) });
-    emit({ ev: "profileSaved", profile });
-    emit(await this.status());
+    this.out({ ev: "profileSaved", profile });
+    this.out(await this.status());
     await this.profileGet(profile);
   }
 
@@ -1276,8 +1319,8 @@ class Remote {
     await this.requireProfile(profile);
     if (!newName) throw new RemoteError("a name for the copy is required");
     await this.api("/api/profiles", { method: "POST", body: JSON.stringify({ name: newName, clone_from: profile }) });
-    emit({ ev: "created", name: newName });
-    emit(await this.status());
+    this.out({ ev: "created", name: newName });
+    this.out(await this.status());
   }
 
   // Roster sections live in the file the hermes-bot-kit Desktop plugin reads, so Hermes Desktop
@@ -1310,19 +1353,21 @@ class Remote {
   async profileSection(profile: string, section: string) {
     await this.requireProfile(profile);
     const layout = await this.readSections();
-    const key = Object.keys(layout.assign).find((k) => k.toLowerCase() === profile.toLowerCase());
+    // The sections file is this laptop's and is keyed by roster name.
+    const shown = this.alias(profile);
+    const key = Object.keys(layout.assign).find((k) => k.toLowerCase() === shown.toLowerCase());
     const left = key ? layout.assign[key] : "";
     if (key) delete layout.assign[key];
     const name = section.trim();
     if (name !== "" && name.toLowerCase() !== "unassigned") {
       const known = layout.sections.find((s) => s.toLowerCase() === name.toLowerCase());
       if (!known) layout.sections.push(name);
-      layout.assign[profile] = known ?? name;
+      layout.assign[shown] = known ?? name;
     }
     // A section lasts as long as a bot is in it: drop the one this bot just emptied.
     if (left !== "" && !Object.values(layout.assign).includes(left)) layout.sections = layout.sections.filter((s) => s !== left);
     await Bun.write(this.sectionsPath, JSON.stringify({ ...layout.raw, sections: layout.sections, assign: layout.assign }, null, 2) + "\n");
-    emit(await this.status());
+    this.out(await this.status());
   }
 
   async profileFlag(profile: string, flag: "pinned" | "hidden", value: boolean) {
@@ -1334,8 +1379,8 @@ class Remote {
     const applied = (r.applied as Json | undefined) ?? {};
     if (applied.ui_meta !== true)
       throw new RemoteError(applied.ui_meta_conflicts ? `@${profile} was changed elsewhere; try again` : `could not update @${profile}`);
-    emit({ ev: "profileSaved", profile });
-    emit(await this.status());
+    this.out({ ev: "profileSaved", profile });
+    this.out(await this.status());
     await this.profileGet(profile);
   }
 
@@ -1345,8 +1390,8 @@ class Remote {
     if (sid) this.replyBySession.delete(sid);
     this.sessionByProfile.delete(name);
     await this.api(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
-    emit({ ev: "deleted", name });
-    emit(await this.status());
+    this.out({ ev: "deleted", name });
+    this.out(await this.status());
   }
 
   async setModel(profile: string, provider: string, model: string) {
@@ -1359,8 +1404,8 @@ class Remote {
       await this.api(`/api/profiles/${encodeURIComponent(profile)}/model`, {
         method: "PUT", body: JSON.stringify({ provider, model }) });
     }
-    emit({ ev: "model", profile, provider, model });
-    emit(await this.status());
+    this.out({ ev: "model", profile, provider, model });
+    this.out(await this.status());
   }
 
   // Reasoning effort. An open chat reports what its agent runs with; without one the bot's
@@ -1369,7 +1414,7 @@ class Remote {
     await this.requireProfile(profile);
     const sid = this.sessionByProfile.get(profile);
     const r = await this.rpc("config.get", { key: "reasoning", ...(sid ? { session_id: sid } : {}), ...this.profileParam(profile) });
-    emit({ ev: "effort", profile, value: String(r.value ?? "") });
+    this.out({ ev: "effort", profile, value: String(r.value ?? "") });
   }
 
   // scope "global" writes agent.reasoning_effort into this bot's config.yaml (the profile param
@@ -1380,7 +1425,7 @@ class Remote {
     const sid = this.sessionByProfile.get(profile);
     await this.rpc("config.set", { key: "reasoning", value, scope: "global",
       ...(sid ? { session_id: sid } : {}), ...this.profileParam(profile) });
-    emit({ ev: "effort", profile, value, changed: true });
+    this.out({ ev: "effort", profile, value, changed: true });
   }
 
   // Bot Screen. The display ticket and viewer_id come from display.observe on this helper's /api/ws,
@@ -1400,7 +1445,7 @@ class Remote {
       && lease.viewer_hash === createHash("sha256").update(viewer).digest("hex").slice(0, 12);
     const state = { profile, running: typeof s.running === "boolean" ? s.running : prev?.running ?? false, lease, mine };
     this.screenByProfile.set(profile, state);
-    emit({ ev: "screen", ...state });
+    this.out({ ev: "screen", ...state });
     return state;
   }
 
@@ -1465,7 +1510,7 @@ class Remote {
       link.closed = true;
       const message = e instanceof Error ? e.message : String(e);
       // The page only sees a close code; surface the backend reason in the panel too.
-      emit({ ev: "screen.error", profile: link.profile, message });
+      this.out({ ev: "screen.error", profile: link.profile, message });
       ws.close(1011, message.slice(0, 100));
     }
   }
@@ -1539,13 +1584,13 @@ class Remote {
     const s = await this.screenLease(profile, "take");
     if (!s.mine) throw new RemoteError(`could not take over @${profile}'s screen`);
     this.demoByProfile.set(profile, new DemoRecorder());
-    emit({ ev: "demo", profile, recording: true });
+    this.out({ ev: "demo", profile, recording: true });
   }
 
   async demoStop(profile: string) {
     const steps = this.demoByProfile.get(profile)?.finish() ?? [];
     this.demoByProfile.delete(profile);
-    emit({ ev: "demo", profile, recording: false, steps });
+    this.out({ ev: "demo", profile, recording: false, steps });
     // Closing the screen page already hands control back; only a still-held screen needs releasing.
     if (this.screenByProfile.get(profile)?.mine) await this.screenLease(profile, "handback");
   }
@@ -1560,7 +1605,7 @@ class Remote {
 
   async groups() {
     const r = await this.rpc("groups.list", { limit: 50 });
-    emit({ ev: "groups", rooms: ((r.rooms as Json[]) ?? []).map((x) => ({
+    this.out({ ev: "groups", rooms: ((r.rooms as Json[]) ?? []).map((x) => ({
       id: String(x.room_id), name: String(x.name ?? x.room_id),
       members: ((x.members as Json[]) ?? []).map((m) => String(m.handle ?? m.profile ?? m.member_id)),
       updatedAt: Number(x.updated_at ?? 0) })) });
@@ -1586,7 +1631,7 @@ class Remote {
     const head = await this.rpc("groups.log", { room_id: room, since_seq: 0, limit: 1 });
     this.openRoom = room;
     this.roomSeq = Math.max(0, Number(head.latest_seq ?? 0) - 150);
-    emit({ ev: "group.opened", room });
+    this.out({ ev: "group.opened", room });
     await this.groupPoll();
     this.roomTimer = setInterval(() => void this.groupPoll(), 2500);
   }
@@ -1622,9 +1667,9 @@ class Remote {
       // Idle polls stay quiet; every connected panel receives these broadcasts.
       if (rows.length === 0 && status === this.roomStatus) return;
       this.roomStatus = status;
-      emit({ ev: "group.log", room, rows, working, actions });
+      this.out({ ev: "group.log", room, rows, working, actions });
     } catch (e) {
-      emit({ ev: "group.error", room, message: e instanceof Error ? e.message : String(e) });
+      this.out({ ev: "group.error", room, message: e instanceof Error ? e.message : String(e) });
     } finally {
       this.roomPolling = false;
     }
@@ -1666,7 +1711,7 @@ class Remote {
         const row = roomRow(e);
         const text = String(row?.text ?? "").trim();
         if (!row || !text) continue;
-        emit({ ev: "group.activity", room, name: String(x.name ?? room), who: String(row.who), text: text.slice(0, 300),
+        this.out({ ev: "group.activity", room, name: String(x.name ?? room), who: String(row.who), text: text.slice(0, 300),
           mention: /(^|\s)@(user|everyone|all)\b/i.test(text) });
       }
     }
@@ -1685,14 +1730,14 @@ class Remote {
 
   async groupStop(room: string) {
     const r = await this.rpc("groups.stop", { room_id: room });
-    emit({ ev: "group.stopped", room, cancelled: Number(r.cancelled ?? 0) });
+    this.out({ ev: "group.stopped", room, cancelled: Number(r.cancelled ?? 0) });
     if (room === this.openRoom) await this.groupPoll();
   }
 
   async groupDisband(room: string) {
     await this.rpc("groups.disband", { room_id: room });
     if (room === this.openRoom) this.groupClose();
-    emit({ ev: "group.disbanded", room });
+    this.out({ ev: "group.disbanded", room });
     await this.groups();
   }
 
@@ -1701,18 +1746,18 @@ class Remote {
     try {
       await run();
     } catch (e) {
-      emit({ ev: "group.error", room, message: e instanceof Error ? e.message : String(e) });
+      this.out({ ev: "group.error", room, message: e instanceof Error ? e.message : String(e) });
     }
   }
 
   private screenCommand(profile: string, run: () => Promise<unknown>) {
     // Starting a screen can take seconds; keep the NDJSON loop free and report failures per bot.
-    void run().catch((e) => emit({ ev: "screen.error", profile, message: e instanceof Error ? e.message : String(e) }));
+    void run().catch((e) => this.out({ ev: "screen.error", profile, message: e instanceof Error ? e.message : String(e) }));
   }
 
   async handle(c: Command) {
     switch (c.cmd) {
-      case "refresh": return emit(await this.status());
+      case "refresh": return this.out(await this.status());
       case "reconnect": return this.reconnect();
       case "inject": return this.onFrame(c.frame);
       case "speak": return this.speak(c.profile, c.text, c.play !== false);
@@ -1747,9 +1792,9 @@ class Remote {
       case "new": {
         try {
           await this.newSession(c.profile);
-          return emit({ ev: "cleared", profile: c.profile });
+          return this.out({ ev: "cleared", profile: c.profile });
         } catch (e) {
-          return emit({ ev: "error", profile: c.profile, message: e instanceof Error ? e.message : String(e) });
+          return this.out({ ev: "error", profile: c.profile, message: e instanceof Error ? e.message : String(e) });
         }
       }
       case "load": return this.load(c.profile);
@@ -1778,7 +1823,7 @@ class Remote {
       }
       case "screen.url":
         await this.requireProfile(c.profile);
-        return emit({ ev: "screen.url", profile: c.profile, base: this.screenBase(), open: c.open === true,
+        return this.out({ ev: "screen.url", profile: c.profile, base: this.screenBase(), open: c.open === true,
           url: `${this.screenBase()}/screen?profile=${encodeURIComponent(c.profile)}` });
       case "screen.take":
       case "screen.handback": {
@@ -1801,7 +1846,168 @@ class Remote {
 }
 
 // Identifies the code a daemon runs, so a client from an updated plugin replaces an older daemon.
-const ownVersion = async () => createHash("sha1").update(await Bun.file(import.meta.path).bytes()).digest("hex").slice(0, 12);
+// The server list counts too: the daemon reads it once, at start.
+const ownVersion = async () => createHash("sha1").update(await Bun.file(import.meta.path).bytes())
+  .update(await Bun.file(serversPath).text().catch(() => "")).digest("hex").slice(0, 12);
+
+// Several servers behind one roster. The main server's bots keep their names; an extra server's
+// default bot is named after the server ("laptop") and its other bots "laptop.<name>". Commands
+// are routed by that name and events are renamed on the way out, so the panel sees one bot list.
+class Hub {
+  private statusBy = new Map<string, Json>();
+  private down = new Set<string>();
+  private clash = new Set<string>();
+  // Approval and question ids are per server; the panel gets them prefixed with the server id.
+  private requests = new Map<string, { server: ExtraServer & { remote: Remote }; id: string | number }>();
+  private turns = new Map<string, { server: string; profile: string }>();
+  private queues = new Map<string, Promise<unknown>>();
+  // Every server reads the same sections file on this laptop, so the newest status has the layout.
+  private sections: unknown;
+  private mainDown = false;
+
+  constructor(private main: Remote, private extras: (ExtraServer & { remote: Remote })[], private configError = "") {
+    main.out = (ev) => {
+      if (ev.ev !== "status") return emit(ev);
+      this.statusBy.set("", ev);
+      this.sections = ev.sections;
+      this.mainDown = false;
+      emit(this.merged());
+    };
+    for (const s of extras) {
+      s.remote.out = (ev) => this.fromExtra(s, ev);
+      s.remote.alias = (profile) => this.shownName(s, profile);
+    }
+  }
+
+  private shownName(s: ExtraServer, profile: string): string {
+    return profile === "default" ? s.id : `${s.id}.${profile}`;
+  }
+
+  private locate(name: string): { server: (ExtraServer & { remote: Remote }) | null; profile: string } {
+    for (const s of this.extras) {
+      if (this.clash.has(s.id)) continue;
+      if (name === s.id) return { server: s, profile: "default" };
+      if (name.startsWith(`${s.id}.`)) return { server: s, profile: name.slice(s.id.length + 1) };
+    }
+    return { server: null, profile: name };
+  }
+
+  private merged(): Json {
+    const mainStatus = this.statusBy.get("");
+    const profiles = [...((mainStatus?.profiles as Json[] | undefined) ?? [])];
+    const taken = new Set(profiles.map((p) => String(p.name)));
+    const servers: Json[] = [];
+    this.clash.clear();
+    for (const s of this.extras) {
+      const st = this.statusBy.get(s.id);
+      if (taken.has(s.id)) {
+        this.clash.add(s.id);
+        servers.push({ id: s.id, label: s.label, ok: false, note: `a bot is already named ${s.id}` });
+        continue;
+      }
+      const ok = st !== undefined && !this.down.has(s.id);
+      servers.push({ id: s.id, label: s.label, ok });
+      if (!ok) continue;
+      for (const p of (st.profiles as Json[] | undefined) ?? [])
+        profiles.push({ ...p, name: this.shownName(s, String(p.name)), isDefault: false, server: s.id, serverLabel: s.label });
+    }
+    const base = mainStatus ?? [...this.statusBy.values()][0] ?? {};
+    return { ...base, ev: "status", ok: true, profiles, servers, sections: this.sections ?? base.sections, mainOff: this.mainDown };
+  }
+
+  private fromExtra(s: ExtraServer, ev: Json) {
+    if (ev.ev === "status") {
+      this.statusBy.set(s.id, ev);
+      this.sections = ev.sections;
+      this.down.delete(s.id);
+      return emit(this.merged());
+    }
+    if (ev.ev === "disconnected") {
+      // The panel's connected state follows the main server; here only the turns cut off are ended.
+      for (const [session, turn] of this.turns) {
+        if (turn.server !== s.id) continue;
+        this.turns.delete(session);
+        emit({ ev: "error", profile: turn.profile, session, message: `${s.label}: connection closed` });
+      }
+      return;
+    }
+    const shown: Json = { ...ev };
+    if (typeof shown.profile === "string") shown.profile = this.shownName(s, shown.profile);
+    if ((shown.ev === "created" || shown.ev === "deleted") && typeof shown.name === "string") shown.name = this.shownName(s, shown.name);
+    if (shown.requestId !== undefined) {
+      const id = `${s.id}:${shown.requestId}`;
+      const server = this.extras.find((x) => x.id === s.id);
+      if (server) this.requests.set(id, { server, id: shown.requestId as string | number });
+      shown.requestId = id;
+    }
+    if (shown.ev === "sent" && typeof shown.session === "string") this.turns.set(shown.session, { server: s.id, profile: String(shown.profile) });
+    if (shown.ev === "done" && typeof shown.session === "string") this.turns.delete(shown.session);
+    if (shown.ev === "error") {
+      delete shown.fatal;
+      shown.message = `${s.label}: ${shown.message}`;
+    }
+    emit(shown);
+  }
+
+  // One queue per server: a server that is slow or down does not hold up the others.
+  private enqueue(key: string, label: string, job: () => Promise<unknown>, now = false) {
+    const guarded = () => job().catch((e) => emit({ ev: "error", message: (label ? `${label}: ` : "") + (e instanceof Error ? e.message : String(e)) }));
+    if (now) return void guarded();
+    this.queues.set(key, (this.queues.get(key) ?? Promise.resolve()).then(guarded));
+  }
+
+  // An extra server that does not answer leaves the roster quietly and is asked again later.
+  private refreshExtra(s: ExtraServer & { remote: Remote }, c: Command, now = false) {
+    this.enqueue(s.id, s.label, () => s.remote.handle(c).catch((e) => {
+      process.stderr.write(`${s.id}: ${e instanceof Error ? e.message : String(e)}\n`);
+      if (this.down.has(s.id)) return;
+      this.down.add(s.id);
+      emit(this.merged());
+    }), now);
+  }
+
+  retryDown() {
+    for (const s of this.extras) if (this.down.has(s.id)) this.refreshExtra(s, { cmd: "refresh" });
+  }
+
+  dispatch(c: Command) {
+    if (c.cmd === "refresh" || c.cmd === "reconnect") {
+      // Out of band: a reconnect must be able to unstick a command waiting on a dead socket.
+      const now = c.cmd === "reconnect";
+      if (this.configError && !now) emit({ ev: "error", message: this.configError });
+      this.enqueue("", "", () => this.main.handle(c).catch((e) => {
+        // The other servers' bots stay usable; the panel is told the main one is away.
+        this.mainDown = true;
+        if (this.extras.length > 0) emit(this.merged());
+        throw e;
+      }), now);
+      for (const s of this.extras) this.refreshExtra(s, c, now);
+      return;
+    }
+    if (c.cmd === "speak.stop") {
+      for (const r of [this.main, ...this.extras.map((s) => s.remote)]) void r.handle(c);
+      return;
+    }
+    if (c.cmd === "approve" || c.cmd === "clarify") {
+      const req = this.requests.get(String(c.requestId));
+      // An approval is answered once; a batch of questions is answered one question at a time.
+      if (req && c.cmd === "approve") this.requests.delete(String(c.requestId));
+      if (req) return this.enqueue(req.server.id, req.server.label, () => req.server.remote.handle({ ...c, requestId: req.id }));
+    }
+    const named = "profile" in c ? c.profile : c.cmd === "delete" ? c.name : "";
+    const at = this.locate(String(named ?? ""));
+    const server = at.server;
+    if (!server) return this.enqueue("", "", () => this.main.handle(c));
+    // The microphone is recorded by the main server's helper state; only the bot name is foreign to it.
+    if (c.cmd === "dictate.stop" || c.cmd === "dictate.file") return this.enqueue("", "", () => this.main.handle({ ...c, profile: "default" }));
+    const routed = ("profile" in c ? { ...c, profile: at.profile } : { ...c, name: at.profile }) as Command;
+    this.enqueue(server.id, server.label, () => server.remote.handle(routed));
+  }
+
+  pollCron() {
+    return Promise.all([this.main.pollCron(), ...this.extras.filter((s) => !this.down.has(s.id)).map((s) => s.remote.pollCron().catch(() => {}))]);
+  }
+}
 
 function dial(): Promise<Socket> {
   return new Promise((resolve, reject) => {
@@ -1886,6 +2092,13 @@ async function client() {
 }
 
 async function daemon(remote: Remote) {
+  // A broken server list must not take the main server's bots down; it is reported in the panel.
+  let configError = "";
+  const extras = await loadExtraServers().catch((e) => {
+    configError = e instanceof Error ? e.message : String(e);
+    return [] as ExtraServer[];
+  });
+  const hub = new Hub(remote, extras.map((s) => ({ ...s, remote: new Remote(s.creds) })), configError);
   const version = await ownVersion();
   mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
   if (existsSync(SOCKET_PATH)) {
@@ -1906,9 +2119,6 @@ async function daemon(remote: Remote) {
     }
     for (const c of clients) send(c, ev);
   };
-  const run = (c: Command) => remote.handle(c)
-    .catch((e) => emit({ ev: "error", message: e instanceof Error ? e.message : String(e) }));
-  let queue: Promise<unknown> = Promise.resolve();
   const server = createServer((sock) => {
     sock.setEncoding("utf8");
     send(sock, { ev: "ready", version });
@@ -1931,9 +2141,7 @@ async function daemon(remote: Remote) {
           continue;
         }
         if ((c as { cmd: string }).cmd === "shutdown") return shutdown();
-        // Out of band: a reconnect must be able to unstick a command waiting on a dead socket.
-        if (c.cmd === "reconnect") void run(c);
-        else queue = queue.then(() => run(c));
+        hub.dispatch(c);
       }
     });
     sock.on("error", () => {});
@@ -1965,7 +2173,8 @@ async function daemon(remote: Remote) {
   process.on("SIGINT", shutdown);
   // Nobody can reach a daemon whose socket file is gone, and it would hold the start lock forever.
   setInterval(() => { if (!existsSync(SOCKET_PATH)) shutdown(); }, 10000);
-  const pollCron = () => remote.pollCron()
+  setInterval(() => hub.retryDown(), 30000);
+  const pollCron = () => hub.pollCron()
     .catch((e) => process.stderr.write(`cron poll failed: ${e instanceof Error ? e.message : String(e)}\n`))
     .finally(() => setTimeout(pollCron, CRON_POLL_MS));
   void pollCron();

@@ -504,16 +504,18 @@ Panel {
       primaryClient = ev.primary === true
       break
     case "status":
-      connected = true
-      lastError = ""
+      // With several servers a status can arrive while the main one is away; its bots are then offline.
+      connected = ev.mainOff !== true
+      if (connected) lastError = ""
       profiles = ev.profiles || []
       sectionOrder = ev.sections ? ev.sections.order : []
       sectionByBot = ev.sections ? ev.sections.assign : ({})
       var names = profiles.map(function(p) { return p.name })
       for (var known in transcripts) if (names.indexOf(known) < 0 && known !== "default") forgetBot(known)
-      if (names.indexOf(selected) < 0) selected = "default"
-      serverHost = ev.url.replace(/^https?:\/\//, "")
-      statusLine = "v" + ev.version + (ev.gatewayRunning ? "" : " · gateway off")
+      if (names.indexOf(selected) < 0) selected = names.length === 0 || names.indexOf("default") >= 0 ? "default" : names[0]
+      serverHost = String(ev.url || "").replace(/^https?:\/\//, "")
+      statusLine = (ev.mainOff ? "main server off" : "v" + ev.version + (ev.gatewayRunning ? "" : " · gateway off"))
+        + (ev.servers || []).map(function(s) { return " · " + s.label + (s.ok ? "" : s.note ? " (" + s.note + ")" : " off") }).join("")
       break
     case "session":
       sessionOwner[ev.session] = ev.profile
@@ -1386,6 +1388,9 @@ Panel {
     delete transcripts[name]
     delete busyProfiles[name]
     delete draftByProfile[name]
+    // A bot that comes back (its server was away) loads its chat again.
+    delete loadedProfiles[name]
+    delete historyShown[name]
     if (selected === name) selected = "default"
     if (armedDelete === name) armedDelete = ""
     revision++
@@ -2009,6 +2014,8 @@ Panel {
             }
 
             Button {
+              // The Bot Screen is the main server's desktop; a bot on another server has none here.
+              visible: !(root.selectedProfile && root.selectedProfile.server)
               text: "Screen"
               bordered: true
               foreground: root.dim
@@ -2362,7 +2369,8 @@ Panel {
                 spacing: Style.spacing.sm
 
                 Repeater {
-                  model: root.rosterProfiles
+                  // Groups run on the main server, so only its bots can join.
+                  model: root.rosterProfiles.filter(function(p) { return !p.server })
                   Button {
                     required property var modelData
                     text: "@" + modelData.name
@@ -3945,7 +3953,8 @@ Panel {
               placeholderText: root.steerWorker !== "" ? "Message the worker (Enter) · press Steer again to cancel"
                 : root.busy ? "Steer @" + root.selected + " (Enter)"
                 : "Message @" + root.selected
-              enabled: root.connected
+              // A bot on another server stays usable while the main server is away.
+              enabled: root.connected || !!(root.selectedProfile && root.selectedProfile.server)
               color: root.foreground
               placeholderTextColor: root.dim
               selectionColor: root.alpha(Color.accent, 0.4)
