@@ -11,7 +11,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, openSync, closeSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, closeSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { normalize } from "node:path";
 import type { ServerWebSocket } from "bun";
@@ -70,12 +70,65 @@ type Command =
   | { cmd: "screen.url"; profile: string; open?: boolean }
   | { cmd: "screen.take"; profile: string }
   | { cmd: "screen.handback"; profile: string }
+  | { cmd: "screen.embed" | "screen.embed.stop"; profile: string }
+  | { cmd: "screen.pointer"; profile: string; x: number; y: number; buttons: number }
+  | { cmd: "screen.key"; profile: string; keysym: number; down: boolean }
   | { cmd: "routines"; profile: string }
   | { cmd: "routine.create"; profile: string; name: string; schedule: string; prompt: string }
   | { cmd: "routine.pause" | "routine.resume" | "routine.run" | "routine.delete" | "routine.runs"; profile: string; id: string };
 type Choice = "once" | "session" | "always" | "deny";
 type ScreenState = { profile: string; running: boolean; lease: Json | null; mine: boolean };
 type RfbLink = { profile: string; upstream: WebSocket | null; backlog: (string | Buffer)[]; closed: boolean };
+
+// Bytes that arrive in WebSocket-sized pieces, read back in RFB message-sized pieces.
+class ByteQueue {
+  private chunks: Uint8Array[] = [];
+  length = 0;
+
+  push(b: Uint8Array) {
+    if (b.length === 0) return;
+    this.chunks.push(b);
+    this.length += b.length;
+  }
+
+  // The first n bytes without consuming them, or null while fewer have arrived.
+  peek(n: number): Uint8Array | null {
+    if (this.length < n) return null;
+    if (this.chunks[0].length < n) {
+      const merged = new Uint8Array(n);
+      let at = 0;
+      while (at < n) {
+        const c = this.chunks.shift() as Uint8Array;
+        const part = c.subarray(0, n - at);
+        merged.set(part, at);
+        at += part.length;
+        if (part.length < c.length) this.chunks.unshift(c.subarray(part.length));
+      }
+      this.chunks.unshift(merged);
+    }
+    return this.chunks[0].subarray(0, n);
+  }
+
+  take(n: number): Uint8Array | null {
+    const head = this.peek(n);
+    if (!head) return null;
+    this.chunks[0] = this.chunks[0].subarray(n);
+    if (this.chunks[0].length === 0) this.chunks.shift();
+    this.length -= n;
+    return head;
+  }
+}
+
+// The in-panel Bot Screen: the helper is the RFB client and hands the panel BMP frames on tmpfs.
+type Embed = {
+  profile: string; ws: WebSocket; q: ByteQueue; stage: "version" | "security" | "result" | "init" | "message" | "rect";
+  rects: number; w: number; h: number; fb: Uint8Array; seq: number; lastFrame: number; timer: ReturnType<typeof setTimeout> | null;
+};
+const EMBED_DIR = `${process.env.XDG_RUNTIME_DIR || "/tmp"}/puri-hermes-screen`;
+// At most ~8 frames a second: the next update is requested only after this much time.
+const EMBED_FRAME_MS = 120;
+const u16 = (b: Uint8Array, at: number) => (b[at] << 8) | b[at + 1];
+const u32 = (b: Uint8Array, at: number) => ((b[at] << 24) >>> 0) + (b[at + 1] << 16) + (b[at + 2] << 8) + b[at + 3];
 type HistoryRow = { role: "you" | "bot" | "tool"; text: string };
 type AttachBytes = { bytes: Uint8Array; name: string; mime: string; path: string };
 
@@ -1434,6 +1487,7 @@ class Remote {
   private viewerByProfile = new Map<string, string>();
   private screenByProfile = new Map<string, ScreenState>();
   private profileByKey = new Map<string, string>();
+  private embeds = new Map<string, Embed>();
 
   private noteScreen(profile: string, s: Json): ScreenState {
     if (s.profile_key) this.profileByKey.set(String(s.profile_key), profile);
@@ -1486,6 +1540,206 @@ class Remote {
       ? { ...this.profileParam(profile), viewer_id: viewer }
       : { ...this.profileParam(profile), force: true });
     return this.noteScreen(profile, r);
+  }
+
+  async screenEmbed(profile: string) {
+    this.screenEmbedStop(profile);
+    await this.ensureScreen(profile);
+    const { ticket, path } = await this.observe(profile);
+    const ws = new WebSocket(`${this.creds.url.replace(/^http/, "ws")}${String(path || "/api/display/ws")}`
+      + `?display_ticket=${encodeURIComponent(String(ticket))}`);
+    ws.binaryType = "arraybuffer";
+    const e: Embed = { profile, ws, q: new ByteQueue(), stage: "version", rects: 0, w: 0, h: 0, fb: new Uint8Array(0),
+      seq: 0, lastFrame: 0, timer: null };
+    this.embeds.set(profile, e);
+    ws.onmessage = (m) => {
+      e.q.push(new Uint8Array(m.data as ArrayBuffer));
+      try {
+        this.pumpEmbed(e);
+      } catch (err) {
+        this.out({ ev: "screen.error", profile, message: err instanceof Error ? err.message : String(err) });
+        ws.close();
+      }
+    };
+    ws.onclose = (m) => {
+      if (e.timer) clearTimeout(e.timer);
+      if (this.embeds.get(profile) !== e) return;
+      this.embeds.delete(profile);
+      this.out({ ev: "screen.closed", profile, reason: m.reason || `closed (${m.code})` });
+    };
+  }
+
+  screenEmbedStop(profile: string) {
+    const e = this.embeds.get(profile);
+    if (!e) return;
+    this.embeds.delete(profile);
+    if (e.timer) clearTimeout(e.timer);
+    e.ws.close();
+    for (const n of [0, 1]) rmSync(this.framePath(profile, n), { force: true });
+  }
+
+  // Pointer and key events reach the bot only while this helper holds the lease; the server's bridge
+  // drops them otherwise.
+  screenPointer(profile: string, x: number, y: number, buttons: number) {
+    const e = this.embeds.get(profile);
+    if (!e || e.w === 0) return;
+    const cx = Math.max(0, Math.min(e.w - 1, Math.round(x))), cy = Math.max(0, Math.min(e.h - 1, Math.round(y)));
+    e.ws.send(new Uint8Array([5, buttons & 0xff, cx >> 8, cx & 0xff, cy >> 8, cy & 0xff]));
+  }
+
+  screenKey(profile: string, keysym: number, down: boolean) {
+    const e = this.embeds.get(profile);
+    if (!e || e.w === 0) return;
+    e.ws.send(new Uint8Array([4, down ? 1 : 0, 0, 0, (keysym >>> 24) & 0xff, (keysym >>> 16) & 0xff, (keysym >>> 8) & 0xff, keysym & 0xff]));
+  }
+
+  private framePath(profile: string, n: number): string {
+    return `${EMBED_DIR}/${profile.replace(/[^\w.-]/g, "_")}-${n}.bmp`;
+  }
+
+  // RFB 3.8 as a client of Xvnc (security None, behind the gateway's ticketed bridge). Frames come
+  // as Raw and CopyRect in 32-bit BGRX, which is what a top-down 32-bit BMP stores.
+  private pumpEmbed(e: Embed) {
+    const send = (bytes: number[] | Uint8Array<ArrayBuffer>) => e.ws.send(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+    for (;;) {
+      switch (e.stage) {
+        case "version": {
+          if (!e.q.take(12)) return;
+          send(new TextEncoder().encode("RFB 003.008\n"));
+          e.stage = "security";
+          break;
+        }
+        case "security": {
+          const n = e.q.peek(1);
+          if (!n) return;
+          if (n[0] === 0) throw new RemoteError("the bot screen refused the connection");
+          const types = e.q.take(1 + n[0]);
+          if (!types) return;
+          if (!types.subarray(1).includes(1)) throw new RemoteError("the bot screen asks for a password");
+          send([1]);
+          e.stage = "result";
+          break;
+        }
+        case "result": {
+          const r = e.q.take(4);
+          if (!r) return;
+          if (u32(r, 0) !== 0) throw new RemoteError("the bot screen refused the connection");
+          send([1]); // ClientInit: shared, so the bot's own viewer stays connected
+          e.stage = "init";
+          break;
+        }
+        case "init": {
+          const head = e.q.peek(24);
+          if (!head) return;
+          const init = e.q.take(24 + u32(head, 20));
+          if (!init) return;
+          e.w = u16(init, 0);
+          e.h = u16(init, 2);
+          e.fb = new Uint8Array(e.w * e.h * 4);
+          // SetPixelFormat: 32 bpp, depth 24, little endian, true colour, red<<16 green<<8 blue.
+          send([0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
+          // SetEncodings: CopyRect, Raw, DesktopSize.
+          send([2, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0x21]);
+          this.requestFrame(e, false);
+          e.stage = "message";
+          break;
+        }
+        case "message": {
+          const t = e.q.peek(1);
+          if (!t) return;
+          if (t[0] === 0) {
+            const h = e.q.take(4);
+            if (!h) return;
+            e.rects = u16(h, 2);
+            e.stage = "rect";
+          } else if (t[0] === 1) {
+            const h = e.q.peek(6);
+            if (!h || !e.q.take(6 + u16(h, 4) * 6)) return;
+          } else if (t[0] === 2) {
+            e.q.take(1);
+          } else if (t[0] === 3) {
+            const h = e.q.peek(8);
+            if (!h || !e.q.take(8 + u32(h, 4))) return;
+          } else {
+            throw new RemoteError(`unexpected message ${t[0]} from the bot screen`);
+          }
+          break;
+        }
+        case "rect": {
+          if (e.rects === 0) {
+            e.stage = "message";
+            this.frameDone(e);
+            break;
+          }
+          const h = e.q.peek(12);
+          if (!h) return;
+          const x = u16(h, 0), y = u16(h, 2), w = u16(h, 4), rh = u16(h, 6), enc = u32(h, 8) | 0;
+          if (enc === 0) {
+            const raw = e.q.take(12 + w * rh * 4);
+            if (!raw) return;
+            if (x + w <= e.w && y + rh <= e.h)
+              for (let row = 0; row < rh; row++)
+                e.fb.set(raw.subarray(12 + row * w * 4, 12 + (row + 1) * w * 4), ((y + row) * e.w + x) * 4);
+          } else if (enc === 1) {
+            const r = e.q.take(16);
+            if (!r) return;
+            const sx = u16(r, 12), sy = u16(r, 14);
+            if (x + w <= e.w && y + rh <= e.h && sx + w <= e.w && sy + rh <= e.h) {
+              const rows: Uint8Array[] = [];
+              for (let row = 0; row < rh; row++) rows.push(e.fb.slice(((sy + row) * e.w + sx) * 4, ((sy + row) * e.w + sx + w) * 4));
+              rows.forEach((line, row) => e.fb.set(line, ((y + row) * e.w + x) * 4));
+            }
+          } else if (enc === -223) {
+            e.q.take(12);
+            e.w = w;
+            e.h = rh;
+            e.fb = new Uint8Array(w * rh * 4);
+          } else {
+            throw new RemoteError(`unexpected encoding ${enc} from the bot screen`);
+          }
+          e.rects--;
+          break;
+        }
+      }
+    }
+  }
+
+  private requestFrame(e: Embed, incremental: boolean) {
+    e.ws.send(new Uint8Array([3, incremental ? 1 : 0, 0, 0, 0, 0, e.w >> 8, e.w & 0xff, e.h >> 8, e.h & 0xff]));
+  }
+
+  // Writes the frame, then asks for the next one no sooner than EMBED_FRAME_MS after the last.
+  private frameDone(e: Embed) {
+    if (e.timer) return;
+    e.timer = setTimeout(() => {
+      e.timer = null;
+      if (this.embeds.get(e.profile) !== e) return;
+      e.lastFrame = Date.now();
+      this.writeFrame(e);
+      this.requestFrame(e, true);
+    }, Math.max(0, EMBED_FRAME_MS - (Date.now() - e.lastFrame)));
+  }
+
+  private writeFrame(e: Embed) {
+    const header = new DataView(new ArrayBuffer(54));
+    header.setUint16(0, 0x4d42, true); // "BM"
+    header.setUint32(2, 54 + e.fb.length, true);
+    header.setUint32(10, 54, true);
+    header.setUint32(14, 40, true);
+    header.setInt32(18, e.w, true);
+    header.setInt32(22, -e.h, true); // negative: rows top-down, as RFB sends them
+    header.setUint16(26, 1, true);
+    header.setUint16(28, 32, true);
+    header.setUint32(34, e.fb.length, true);
+    mkdirSync(EMBED_DIR, { recursive: true, mode: 0o700 });
+    e.seq++;
+    const path = this.framePath(e.profile, e.seq % 2);
+    const bytes = new Uint8Array(54 + e.fb.length);
+    bytes.set(new Uint8Array(header.buffer), 0);
+    bytes.set(e.fb, 54);
+    writeFileSync(`${path}.part`, bytes, { mode: 0o600 });
+    renameSync(`${path}.part`, path);
+    this.out({ ev: "screen.frame", profile: e.profile, path, seq: e.seq, w: e.w, h: e.h });
   }
 
   private async openRfb(ws: ServerWebSocket<unknown>) {
@@ -1830,6 +2084,10 @@ class Remote {
         const op = c.cmd === "screen.take" ? "take" : "handback";
         return this.screenCommand(c.profile, () => this.screenLease(c.profile, op));
       }
+      case "screen.embed": return this.screenCommand(c.profile, () => this.screenEmbed(c.profile));
+      case "screen.embed.stop": return this.screenEmbedStop(c.profile);
+      case "screen.pointer": return this.screenPointer(c.profile, c.x, c.y, c.buttons);
+      case "screen.key": return this.screenKey(c.profile, c.keysym, c.down);
       case "routines": return this.routineCommand(c.profile, () => this.routines(c.profile));
       case "routine.create":
         return this.routineCommand(c.profile, () => this.routineCreate(c.profile, c.name, c.schedule, c.prompt));

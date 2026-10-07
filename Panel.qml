@@ -21,7 +21,61 @@ Panel {
   property string statusLine: "Connecting…"
   property string serverHost: ""
   // Edit and an open group room are modes of their own: they take the chat's place instead of squeezing it.
-  readonly property bool drawerTakesOver: editing || (showingGroups && openRoom !== "")
+  readonly property bool drawerTakesOver: editing || (showingGroups && openRoom !== "") || showingScreen
+  // In-panel Bot Screen: the helper writes the bot's frames as BMP files on tmpfs and forwards
+  // pointer and key events while this panel holds the screen lease.
+  property bool showingScreen: false
+  property string screenProfile: ""
+  property var screenFrame: null
+  property string screenNote: ""
+  // While the person drives the bot's screen, keys go there instead of to the panel's shortcuts.
+  readonly property bool shortcutsOn: opened && !(showingScreen && screenMine)
+  function toggleScreen() {
+    if (showingScreen) { closeScreen(); return }
+    closeDrawers("screen")
+    lastError = ""
+    showingScreen = true
+    screenProfile = selected
+    screenFrame = null
+    screenNote = "connecting…"
+    sendCommand({ cmd: "screen.embed", profile: selected })
+  }
+  function closeScreen() {
+    if (!showingScreen) return
+    showingScreen = false
+    screenFrame = null
+    sendCommand({ cmd: "screen.embed.stop", profile: screenProfile })
+    Qt.callLater(function() { input.forceActiveFocus() })
+  }
+  function sendScreenPointer(x, y, buttons) {
+    sendCommand({ cmd: "screen.pointer", profile: screenProfile, x: x, y: y, buttons: buttons })
+  }
+  function sendScreenKey(keysym, down) {
+    sendCommand({ cmd: "screen.key", profile: screenProfile, keysym: keysym, down: down })
+  }
+  // X keysym for a Qt key event; 0 when there is none to send.
+  function keysymFor(event) {
+    var k = event.key
+    var special = {}
+    special[Qt.Key_Return] = 0xff0d; special[Qt.Key_Enter] = 0xff8d; special[Qt.Key_Backspace] = 0xff08
+    special[Qt.Key_Tab] = 0xff09; special[Qt.Key_Backtab] = 0xff09; special[Qt.Key_Escape] = 0xff1b
+    special[Qt.Key_Delete] = 0xffff; special[Qt.Key_Insert] = 0xff63; special[Qt.Key_Home] = 0xff50
+    special[Qt.Key_End] = 0xff57; special[Qt.Key_Left] = 0xff51; special[Qt.Key_Up] = 0xff52
+    special[Qt.Key_Right] = 0xff53; special[Qt.Key_Down] = 0xff54; special[Qt.Key_PageUp] = 0xff55
+    special[Qt.Key_PageDown] = 0xff56; special[Qt.Key_Shift] = 0xffe1; special[Qt.Key_Control] = 0xffe3
+    special[Qt.Key_Alt] = 0xffe9; special[Qt.Key_Meta] = 0xffeb; special[Qt.Key_Super_L] = 0xffeb
+    special[Qt.Key_CapsLock] = 0xffe5; special[Qt.Key_Space] = 0x20
+    if (special[k] !== undefined) return special[k]
+    if (k >= Qt.Key_F1 && k <= Qt.Key_F12) return 0xffbe + (k - Qt.Key_F1)
+    if (k >= Qt.Key_A && k <= Qt.Key_Z) return (event.modifiers & Qt.ShiftModifier ? 0x41 : 0x61) + (k - Qt.Key_A)
+    var t = event.text
+    if (t && t.length === 1 && t.charCodeAt(0) >= 0x20) {
+      var c = t.charCodeAt(0)
+      return c < 0x100 ? c : 0x01000000 + c
+    }
+    // Digits and punctuation pressed with Ctrl carry no text.
+    return k >= 0x20 && k < 0x7f ? k : 0
+  }
   property string lastError: ""
   property var profiles: []
   property string selected: "default"
@@ -351,6 +405,7 @@ Panel {
     // A bot that was just removed has no draft to keep.
     if (draftOwner === "default" || profiles.some(function(p) { return p.name === draftOwner })) draftByProfile[draftOwner] = input.text
     draftOwner = selected
+    closeScreen()
     steerWorker = ""
     input.text = draftByProfile[selected] || ""
     input.cursorPosition = input.text.length
@@ -604,6 +659,16 @@ Panel {
       break
     case "screen.error":
       lastError = "@" + ev.profile + " screen: " + ev.message
+      if (showingScreen && ev.profile === screenProfile) screenNote = ev.message
+      break
+    case "screen.frame":
+      if (showingScreen && ev.profile === screenProfile) {
+        screenFrame = ev
+        screenNote = ""
+      }
+      break
+    case "screen.closed":
+      if (showingScreen && ev.profile === screenProfile) screenNote = "screen disconnected: " + ev.reason
       break
     case "activity":
       var actor = profileForSession(ev.session)
@@ -993,6 +1058,7 @@ Panel {
     if (keep !== "edit") editing = false
     if (keep !== "model") pickingModel = false
     if (keep !== "create") creating = false
+    if (keep !== "screen") closeScreen()
   }
 
   function toggleSessions() {
@@ -1453,6 +1519,31 @@ Panel {
     function newChat(): string { return root.newChat() ? "cleared" : "busy" }
     function answer(text: string): string { return root.answerClarify(text) ? "answered" : "no-question" }
     function setModel(model: string): string { return root.setModel(model) ? "setting" : "invalid" }
+    function screenToggle(): string { root.toggleScreen(); return root.showingScreen ? "shown" : "hidden" }
+    function screenInfo(): string {
+      var f = root.screenFrame
+      return JSON.stringify({ showing: root.showingScreen, seq: f ? f.seq : 0, w: f ? f.w : 0, h: f ? f.h : 0, note: root.screenNote,
+        mine: root.screenMine, painted: [Math.round(screenImage.paintedWidth), Math.round(screenImage.paintedHeight)],
+        focus: screenView.activeFocus })
+    }
+    // Test hooks: a click at a fraction of the drawn frame, and typing, through the same paths as the mouse and keys.
+    function screenTap(fx: real, fy: real): string {
+      if (!root.screenFrame) return "no-frame"
+      var mx = (screenView.width - screenImage.paintedWidth) / 2 + fx * screenImage.paintedWidth
+      var my = (screenView.height - screenImage.paintedHeight) / 2 + fy * screenImage.paintedHeight
+      screenView.pointer(mx, my, 1)
+      screenView.pointer(mx, my, 0)
+      return JSON.stringify(screenView.framePoint(mx, my))
+    }
+    function screenType(text: string): string {
+      for (var i = 0; i < text.length; i++) {
+        var c = text.charCodeAt(i)
+        var sym = c === 10 ? 0xff0d : c < 0x100 ? c : 0x01000000 + c
+        root.sendScreenKey(sym, true)
+        root.sendScreenKey(sym, false)
+      }
+      return "typed"
+    }
     function setEffort(level: string): string { return root.setEffort(level) ? "setting" : "invalid" }
     function effort(): string { return root.effortByProfile[root.selected] || "" }
     function geometry(): string {
@@ -1745,9 +1836,11 @@ Panel {
     ensureLoaded(selected)
     if (showingGroups && openRoom !== "") sendCommand({ cmd: "group.open", room: openRoom })
     Qt.callLater(function() { input.forceActiveFocus() })
-  } else if (openRoom !== "") {
+  } else {
+    // Frames stream only while someone can see them.
+    closeScreen()
     // A room's log is polled only while the panel shows it.
-    sendCommand({ cmd: "group.close" })
+    if (openRoom !== "") sendCommand({ cmd: "group.close" })
   }
 
     BarIconButton {
@@ -1773,8 +1866,10 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: input
-    contentWidth: panel.fittedContentWidth(Style.space(460))
-    contentHeight: panel.fittedContentHeight(Style.space(620), Style.space(620))
+    // The bot's screen needs room; the card grows while it is shown (capped to the monitor).
+    contentWidth: panel.fittedContentWidth(root.showingScreen ? Style.space(1100) : Style.space(460))
+    contentHeight: root.showingScreen ? panel.fittedContentHeight(Style.space(860), Style.space(860))
+      : panel.fittedContentHeight(Style.space(620), Style.space(620))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -1785,24 +1880,24 @@ Panel {
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
         || importPathField.activeFocus || importNameField.activeFocus || groupNameField.activeFocus || roomInput.activeFocus
-        || roomRenameField.activeFocus
+        || roomRenameField.activeFocus || screenView.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       // Window shortcuts: they fire while the panel has keyboard focus, including from the composer.
-      Shortcut { sequence: "Ctrl+N"; enabled: root.opened; onActivated: root.newChat() }
-      Shortcut { sequence: "Ctrl+K"; enabled: root.opened; onActivated: root.toggleSessions() }
-      Shortcut { sequence: "Ctrl+F"; enabled: root.opened; onActivated: root.toggleSearch() }
-      Shortcut { sequence: "Ctrl+Up"; enabled: root.opened; onActivated: root.recallLastSent() }
-      Shortcut { sequence: "Alt+1"; enabled: root.opened; onActivated: root.selectNth(0) }
-      Shortcut { sequence: "Alt+2"; enabled: root.opened; onActivated: root.selectNth(1) }
-      Shortcut { sequence: "Alt+3"; enabled: root.opened; onActivated: root.selectNth(2) }
-      Shortcut { sequence: "Alt+4"; enabled: root.opened; onActivated: root.selectNth(3) }
-      Shortcut { sequence: "Alt+5"; enabled: root.opened; onActivated: root.selectNth(4) }
-      Shortcut { sequence: "Alt+6"; enabled: root.opened; onActivated: root.selectNth(5) }
-      Shortcut { sequence: "Alt+7"; enabled: root.opened; onActivated: root.selectNth(6) }
-      Shortcut { sequence: "Alt+8"; enabled: root.opened; onActivated: root.selectNth(7) }
-      Shortcut { sequence: "Alt+9"; enabled: root.opened; onActivated: root.selectNth(8) }
+      Shortcut { sequence: "Ctrl+N"; enabled: root.shortcutsOn; onActivated: root.newChat() }
+      Shortcut { sequence: "Ctrl+K"; enabled: root.shortcutsOn; onActivated: root.toggleSessions() }
+      Shortcut { sequence: "Ctrl+F"; enabled: root.shortcutsOn; onActivated: root.toggleSearch() }
+      Shortcut { sequence: "Ctrl+Up"; enabled: root.shortcutsOn; onActivated: root.recallLastSent() }
+      Shortcut { sequence: "Alt+1"; enabled: root.shortcutsOn; onActivated: root.selectNth(0) }
+      Shortcut { sequence: "Alt+2"; enabled: root.shortcutsOn; onActivated: root.selectNth(1) }
+      Shortcut { sequence: "Alt+3"; enabled: root.shortcutsOn; onActivated: root.selectNth(2) }
+      Shortcut { sequence: "Alt+4"; enabled: root.shortcutsOn; onActivated: root.selectNth(3) }
+      Shortcut { sequence: "Alt+5"; enabled: root.shortcutsOn; onActivated: root.selectNth(4) }
+      Shortcut { sequence: "Alt+6"; enabled: root.shortcutsOn; onActivated: root.selectNth(5) }
+      Shortcut { sequence: "Alt+7"; enabled: root.shortcutsOn; onActivated: root.selectNth(6) }
+      Shortcut { sequence: "Alt+8"; enabled: root.shortcutsOn; onActivated: root.selectNth(7) }
+      Shortcut { sequence: "Alt+9"; enabled: root.shortcutsOn; onActivated: root.selectNth(8) }
 
       Column {
         id: header
@@ -2021,7 +2116,8 @@ Panel {
               foreground: root.dim
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
-              onClicked: root.openScreen()
+              selected: root.showingScreen
+              onClicked: root.toggleScreen()
             }
           }
 
@@ -2075,6 +2171,17 @@ Panel {
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               onClicked: root.stopDemo()
+            }
+
+            Button {
+              visible: root.showingScreen
+              text: "Browser"
+              tooltipText: "Open the bot's screen in a browser page"
+              bordered: true
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: root.openScreen()
             }
 
             Button {
@@ -3325,6 +3432,124 @@ Panel {
         }
 
         PanelSeparator { foreground: root.foreground }
+      }
+
+      // The selected bot's desktop, drawn from the helper's frames. Clicks and keys reach it only
+      // after Take over (the server drops input from viewers without the lease).
+      Item {
+        id: screenView
+        visible: root.showingScreen
+        anchors.top: header.bottom
+        anchors.topMargin: Style.space(8)
+        anchors.bottom: footer.top
+        anchors.bottomMargin: Style.space(8)
+        width: parent.width
+        property var held: ({})
+        property var pendingMove: null
+
+        function framePoint(mx, my) {
+          var f = root.screenFrame
+          var scale = f.w / screenImage.paintedWidth
+          return { x: (mx - (width - screenImage.paintedWidth) / 2) * scale, y: (my - (height - screenImage.paintedHeight) / 2) * scale }
+        }
+        function buttonMask(b) {
+          return (b & Qt.LeftButton ? 1 : 0) | (b & Qt.MiddleButton ? 2 : 0) | (b & Qt.RightButton ? 4 : 0)
+        }
+        function pointer(mx, my, mask) {
+          var p = framePoint(mx, my)
+          root.sendScreenPointer(p.x, p.y, mask)
+        }
+
+        Image {
+          id: screenImage
+          anchors.fill: parent
+          fillMode: Image.PreserveAspectFit
+          // Each frame is a new file name; a cached or async load would flash the old one or nothing.
+          cache: false
+          asynchronous: false
+          smooth: true
+          mipmap: true
+          source: root.screenFrame ? "file://" + root.screenFrame.path + "?" + root.screenFrame.seq : ""
+        }
+
+        Rectangle {
+          visible: root.screenMine && root.screenFrame !== null
+          x: (parent.width - screenImage.paintedWidth) / 2 - 1
+          y: (parent.height - screenImage.paintedHeight) / 2 - 1
+          width: screenImage.paintedWidth + 2
+          height: screenImage.paintedHeight + 2
+          color: "transparent"
+          border.color: screenView.activeFocus ? Color.accent : root.dim
+          border.width: 1
+        }
+
+        Text {
+          anchors.centerIn: parent
+          width: parent.width - Style.space(40)
+          visible: root.screenNote !== ""
+          horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.Wrap
+          text: root.screenNote
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Timer {
+          id: moveTimer
+          interval: 33
+          onTriggered: if (screenView.pendingMove) {
+            var m = screenView.pendingMove
+            screenView.pendingMove = null
+            screenView.pointer(m.x, m.y, m.mask)
+          }
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          enabled: root.screenMine && root.screenFrame !== null
+          hoverEnabled: true
+          acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
+          onPressed: (mouse) => {
+            screenView.forceActiveFocus()
+            screenView.pointer(mouse.x, mouse.y, screenView.buttonMask(mouse.buttons))
+          }
+          onReleased: (mouse) => screenView.pointer(mouse.x, mouse.y, screenView.buttonMask(mouse.buttons))
+          // Moves are sent at most ~30 times a second, always ending on the latest position.
+          onPositionChanged: (mouse) => {
+            screenView.pendingMove = { x: mouse.x, y: mouse.y, mask: screenView.buttonMask(mouse.buttons) }
+            if (!moveTimer.running) moveTimer.start()
+          }
+          // RFB wheel steps are presses of buttons 4 (up) and 5 (down).
+          onWheel: (wheel) => {
+            var mask = screenView.buttonMask(wheel.buttons)
+            var step = wheel.angleDelta.y > 0 ? 8 : 16
+            screenView.pointer(wheel.x, wheel.y, mask | step)
+            screenView.pointer(wheel.x, wheel.y, mask)
+          }
+        }
+
+        Keys.onPressed: (event) => {
+          event.accepted = true
+          if (event.isAutoRepeat || !root.screenMine) return
+          var sym = root.keysymFor(event)
+          if (sym === 0) return
+          held[event.key] = sym
+          root.sendScreenKey(sym, true)
+        }
+        Keys.onReleased: (event) => {
+          event.accepted = true
+          if (event.isAutoRepeat) return
+          var sym = held[event.key]
+          if (sym === undefined) return
+          delete held[event.key]
+          root.sendScreenKey(sym, false)
+        }
+        // Keys still down when focus leaves would stay pressed on the bot's screen.
+        onActiveFocusChanged: if (!activeFocus) {
+          for (var k in held) root.sendScreenKey(held[k], false)
+          held = ({})
+        }
       }
 
       Flickable {

@@ -32,7 +32,7 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 - 질문(clarify)·승인 카드, 긴급 알림, 루틴(cron) 완료 알림
 - 이미지·파일 보내기/받기(파일 칩), 대화 History(대화마다 이름 바꾸기·보관·삭제, 삭제는 두 번 클릭), 다시 불러온 대화의 cron 지시문·첨부 확장문은 접어서 표시(클릭하면 전체)
 - Routines: 목록·생성·즉시 실행·일시정지·삭제·실행 기록
-- Screen: 봇 데스크톱 실시간 보기, 넘겨받기/돌려주기
+- Screen: 패널 안에서 봇 데스크톱을 보고 조작. **Screen**을 누르면 패널이 넓어지며 대화 자리에 봇 화면이 뜨고(초당 최대 약 8장, 바뀐 때만), **Take over** 뒤에는 클릭·드래그·휠·키보드가 봇 화면으로 감(화면을 한 번 누르면 테두리가 강조색이 되고 키 입력을 받음, 그동안 패널 단축키는 꺼짐). **Hand back**으로 돌려주고, **Screen**을 다시 누르거나 패널을 닫으면 화면 받기도 멈춤. 헬퍼가 RFB를 직접 받아 `$XDG_RUNTIME_DIR/puri-hermes-screen/`에 BMP로 쓰고 패널이 그 파일을 그림. 한글처럼 입력기(IME)를 거치는 글자는 전달되지 않음. 브라우저 페이지는 화면 줄의 **Browser**(시연 기록은 지금처럼 브라우저 페이지에서) (IPC `screenToggle`, `screenInfo`, `screenTake`, `screenHandback`)
 - 스킬 `/`: 입력창이 `/`로 시작하면 봇의 스킬 제안 목록(최대 6개, ↑/↓ 이동, Tab·클릭 완성, Esc 닫기). `/스킬이름 …`은 `command.dispatch`로 실행되고 대화에는 게이트웨이의 표시 문구가 남음. 모르는 `/x`는 그냥 텍스트로 보냄. Edit의 "Save as skill"은 마지막으로 보낸 질문을 SKILL.md로 저장(삭제 API는 없음)
 - 연결 끊김 시 Reconnect
 
