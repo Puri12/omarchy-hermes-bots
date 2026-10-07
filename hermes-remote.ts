@@ -70,7 +70,7 @@ type Command =
   | { cmd: "screen.url"; profile: string; open?: boolean }
   | { cmd: "screen.take"; profile: string }
   | { cmd: "screen.handback"; profile: string }
-  | { cmd: "screen.embed" | "screen.embed.stop"; profile: string }
+  | { cmd: "screen.embed" | "screen.embed.stop"; profile: string; client?: number }
   | { cmd: "screen.pointer"; profile: string; x: number; y: number; buttons: number }
   | { cmd: "screen.key"; profile: string; keysym: number; down: boolean }
   | { cmd: "routines"; profile: string }
@@ -123,6 +123,9 @@ class ByteQueue {
 type Embed = {
   profile: string; ws: WebSocket; q: ByteQueue; stage: "version" | "security" | "result" | "init" | "message" | "rect";
   rects: number; w: number; h: number; fb: Uint8Array; seq: number; lastFrame: number; timer: ReturnType<typeof setTimeout> | null;
+  // Bytes received from the server so far; ZRLE's one zlib stream lives for the whole connection.
+  bytes: number; pumping: boolean;
+  z: { writer: WritableStreamDefaultWriter<BufferSource>; reader: ReadableStreamDefaultReader<Uint8Array>; out: ByteQueue } | null;
 };
 const EMBED_DIR = `${process.env.XDG_RUNTIME_DIR || "/tmp"}/puri-hermes-screen`;
 // At most ~8 frames a second: the next update is requested only after this much time.
@@ -1442,6 +1445,7 @@ class Remote {
     const sid = this.sessionByProfile.get(name);
     if (sid) this.replyBySession.delete(sid);
     this.sessionByProfile.delete(name);
+    this.screenEmbedStop(name);
     await this.api(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
     this.out({ ev: "deleted", name });
     this.out(await this.status());
@@ -1542,7 +1546,20 @@ class Remote {
     return this.noteScreen(profile, r);
   }
 
-  async screenEmbed(profile: string) {
+  // Panels watching each bot's screen. A second panel joins the running stream instead of
+  // restarting it (a restart drops the lease the first one holds).
+  private embedUsers = new Map<string, Set<number>>();
+
+  async screenEmbed(profile: string, client = 0) {
+    const users = this.embedUsers.get(profile) ?? new Set<number>();
+    users.add(client);
+    this.embedUsers.set(profile, users);
+    const running = this.embeds.get(profile);
+    if (running) {
+      // Still shaking hands: its first frame reaches every panel anyway.
+      if (running.w > 0) this.writeFrame(running);
+      return;
+    }
     this.screenEmbedStop(profile);
     await this.ensureScreen(profile);
     const { ticket, path } = await this.observe(profile);
@@ -1550,16 +1567,13 @@ class Remote {
       + `?display_ticket=${encodeURIComponent(String(ticket))}`);
     ws.binaryType = "arraybuffer";
     const e: Embed = { profile, ws, q: new ByteQueue(), stage: "version", rects: 0, w: 0, h: 0, fb: new Uint8Array(0),
-      seq: 0, lastFrame: 0, timer: null };
+      seq: 0, lastFrame: 0, timer: null, bytes: 0, pumping: false, z: null };
     this.embeds.set(profile, e);
     ws.onmessage = (m) => {
-      e.q.push(new Uint8Array(m.data as ArrayBuffer));
-      try {
-        this.pumpEmbed(e);
-      } catch (err) {
-        this.out({ ev: "screen.error", profile, message: err instanceof Error ? err.message : String(err) });
-        ws.close();
-      }
+      const chunk = new Uint8Array(m.data as ArrayBuffer);
+      e.bytes += chunk.length;
+      e.q.push(chunk);
+      void this.runPump(e);
     };
     ws.onclose = (m) => {
       if (e.timer) clearTimeout(e.timer);
@@ -1569,13 +1583,110 @@ class Remote {
     };
   }
 
-  screenEmbedStop(profile: string) {
+  // Without a client the stream stops for everyone (the bot was deleted).
+  screenEmbedStop(profile: string, client?: number) {
+    const users = this.embedUsers.get(profile);
+    if (client !== undefined && users) {
+      users.delete(client);
+      if (users.size > 0) return;
+    }
+    this.embedUsers.delete(profile);
     const e = this.embeds.get(profile);
     if (!e) return;
     this.embeds.delete(profile);
     if (e.timer) clearTimeout(e.timer);
     e.ws.close();
+    void e.z?.writer.close().catch(() => {});
     for (const n of [0, 1]) rmSync(this.framePath(profile, n), { force: true });
+  }
+
+  // A panel that went away without saying so (shell restart) stops counting as a viewer.
+  embedClientGone(client: number) {
+    for (const profile of [...this.embedUsers.keys()]) this.screenEmbedStop(profile, client);
+  }
+
+  // One pump at a time per stream; data that arrives while it awaits is picked up by its loop.
+  private async runPump(e: Embed) {
+    if (e.pumping) return;
+    e.pumping = true;
+    try {
+      await this.pumpEmbed(e);
+    } catch (err) {
+      this.out({ ev: "screen.error", profile: e.profile, message: err instanceof Error ? err.message : String(err) });
+      e.ws.close();
+    } finally {
+      e.pumping = false;
+    }
+  }
+
+  // ZRLE: 64x64 tiles from one zlib stream, pixels as 3-byte CPIXELs (B, G, R for this pixel format).
+  private async zrleRect(e: Embed, x: number, y: number, w: number, h: number, data: Uint8Array<ArrayBuffer>) {
+    const z = e.z ?? (e.z = (() => {
+      const ds = new DecompressionStream("deflate");
+      return { writer: ds.writable.getWriter(), reader: ds.readable.getReader(), out: new ByteQueue() };
+    })());
+    void z.writer.write(data).catch(() => {});
+    const need = async (n: number): Promise<Uint8Array> => {
+      while (z.out.length < n) {
+        const r = await z.reader.read();
+        if (r.done) throw new RemoteError("the bot screen's compressed stream ended");
+        z.out.push(r.value);
+      }
+      return z.out.take(n) as Uint8Array;
+    };
+    const fb = e.fb, stride = e.w;
+    const put = (px: number, py: number, c: Uint8Array, at: number) => {
+      const o = (py * stride + px) * 4;
+      fb[o] = c[at]; fb[o + 1] = c[at + 1]; fb[o + 2] = c[at + 2]; fb[o + 3] = 0;
+    };
+    const runLength = async () => {
+      let len = 1;
+      for (;;) {
+        const b = (await need(1))[0];
+        len += b;
+        if (b !== 255) return len;
+      }
+    };
+    for (let ty = y; ty < y + h; ty += 64) {
+      const th = Math.min(64, y + h - ty);
+      for (let tx = x; tx < x + w; tx += 64) {
+        const tw = Math.min(64, x + w - tx), n = tw * th;
+        const at = (i: number): [number, number] => [tx + (i % tw), ty + Math.floor(i / tw)];
+        const sub = (await need(1))[0];
+        if (sub === 0) {
+          const raw = await need(n * 3);
+          for (let i = 0; i < n; i++) put(...at(i), raw, i * 3);
+        } else if (sub === 1) {
+          const c = (await need(3)).slice();
+          for (let i = 0; i < n; i++) put(...at(i), c, 0);
+        } else if (sub <= 16) {
+          const palette = (await need(sub * 3)).slice();
+          const bits = sub === 2 ? 1 : sub <= 4 ? 2 : 4, rowBytes = Math.ceil(tw * bits / 8);
+          const packed = await need(rowBytes * th);
+          for (let row = 0; row < th; row++)
+            for (let col = 0; col < tw; col++) {
+              const bit = col * bits, byte = packed[row * rowBytes + (bit >> 3)];
+              const index = (byte >> (8 - bits - (bit & 7))) & ((1 << bits) - 1);
+              put(tx + col, ty + row, palette, index * 3);
+            }
+        } else if (sub === 128) {
+          for (let i = 0; i < n;) {
+            const c = (await need(3)).slice();
+            const len = await runLength();
+            for (let k = 0; k < len && i < n; k++, i++) put(...at(i), c, 0);
+          }
+        } else if (sub >= 130) {
+          const palette = (await need((sub - 128) * 3)).slice();
+          for (let i = 0; i < n;) {
+            const index = (await need(1))[0];
+            const len = index & 128 ? await runLength() : 1;
+            for (let k = 0; k < len && i < n; k++, i++) put(...at(i), palette, (index & 127) * 3);
+          }
+        } else {
+          throw new RemoteError(`unexpected ZRLE tile type ${sub} from the bot screen`);
+        }
+      }
+    }
   }
 
   // Pointer and key events reach the bot only while this helper holds the lease; the server's bridge
@@ -1599,7 +1710,7 @@ class Remote {
 
   // RFB 3.8 as a client of Xvnc (security None, behind the gateway's ticketed bridge). Frames come
   // as Raw and CopyRect in 32-bit BGRX, which is what a top-down 32-bit BMP stores.
-  private pumpEmbed(e: Embed) {
+  private async pumpEmbed(e: Embed) {
     const send = (bytes: number[] | Uint8Array<ArrayBuffer>) => e.ws.send(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
     for (;;) {
       switch (e.stage) {
@@ -1638,8 +1749,8 @@ class Remote {
           e.fb = new Uint8Array(e.w * e.h * 4);
           // SetPixelFormat: 32 bpp, depth 24, little endian, true colour, red<<16 green<<8 blue.
           send([0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
-          // SetEncodings: CopyRect, Raw, DesktopSize.
-          send([2, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0x21]);
+          // SetEncodings: ZRLE (compressed; a fraction of Raw's bytes over the network), CopyRect, Raw, DesktopSize.
+          send([2, 0, 0, 4, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0x21]);
           this.requestFrame(e, false);
           e.stage = "message";
           break;
@@ -1689,6 +1800,13 @@ class Remote {
               for (let row = 0; row < rh; row++) rows.push(e.fb.slice(((sy + row) * e.w + sx) * 4, ((sy + row) * e.w + sx + w) * 4));
               rows.forEach((line, row) => e.fb.set(line, ((y + row) * e.w + x) * 4));
             }
+          } else if (enc === 16) {
+            const head = e.q.peek(16);
+            if (!head) return;
+            const all = e.q.take(16 + u32(head, 12));
+            if (!all) return;
+            if (x + w <= e.w && y + rh <= e.h) await this.zrleRect(e, x, y, w, rh, all.slice(16));
+            else throw new RemoteError("the bot screen sent a tile outside the screen");
           } else if (enc === -223) {
             e.q.take(12);
             e.w = w;
@@ -1739,7 +1857,7 @@ class Remote {
     bytes.set(e.fb, 54);
     writeFileSync(`${path}.part`, bytes, { mode: 0o600 });
     renameSync(`${path}.part`, path);
-    this.out({ ev: "screen.frame", profile: e.profile, path, seq: e.seq, w: e.w, h: e.h });
+    this.out({ ev: "screen.frame", profile: e.profile, path, seq: e.seq, w: e.w, h: e.h, bytes: e.bytes });
   }
 
   private async openRfb(ws: ServerWebSocket<unknown>) {
@@ -2084,8 +2202,8 @@ class Remote {
         const op = c.cmd === "screen.take" ? "take" : "handback";
         return this.screenCommand(c.profile, () => this.screenLease(c.profile, op));
       }
-      case "screen.embed": return this.screenCommand(c.profile, () => this.screenEmbed(c.profile));
-      case "screen.embed.stop": return this.screenEmbedStop(c.profile);
+      case "screen.embed": return this.screenCommand(c.profile, () => this.screenEmbed(c.profile, c.client ?? 0));
+      case "screen.embed.stop": return this.screenEmbedStop(c.profile, c.client ?? 0);
       case "screen.pointer": return this.screenPointer(c.profile, c.x, c.y, c.buttons);
       case "screen.key": return this.screenKey(c.profile, c.keysym, c.down);
       case "routines": return this.routineCommand(c.profile, () => this.routines(c.profile));
@@ -2222,6 +2340,10 @@ class Hub {
       this.down.add(s.id);
       emit(this.merged());
     }), now);
+  }
+
+  clientGone(client: number) {
+    for (const r of [this.main, ...this.extras.map((s) => s.remote)]) r.embedClientGone(client);
   }
 
   retryDown() {
@@ -2377,7 +2499,9 @@ async function daemon(remote: Remote) {
     }
     for (const c of clients) send(c, ev);
   };
+  let nextClient = 0;
   const server = createServer((sock) => {
+    const clientId = ++nextClient;
     sock.setEncoding("utf8");
     send(sock, { ev: "ready", version });
     // Every panel instance gets every event; only the oldest one raises desktop notifications.
@@ -2399,11 +2523,14 @@ async function daemon(remote: Remote) {
           continue;
         }
         if ((c as { cmd: string }).cmd === "shutdown") return shutdown();
+        // The screen stream counts its viewers per panel connection.
+        if (c.cmd === "screen.embed" || c.cmd === "screen.embed.stop") c.client = clientId;
         hub.dispatch(c);
       }
     });
     sock.on("error", () => {});
     sock.on("close", () => {
+      hub.clientGone(clientId);
       const wasPrimary = clients.values().next().value === sock;
       clients.delete(sock);
       const next = clients.values().next().value;

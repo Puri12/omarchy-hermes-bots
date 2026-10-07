@@ -53,6 +53,44 @@ Panel {
   function sendScreenKey(keysym, down) {
     sendCommand({ cmd: "screen.key", profile: screenProfile, keysym: keysym, down: down })
   }
+  // Keys held on the bot's screen, by Qt key, so each release sends the keysym its press sent.
+  property var screenHeld: ({})
+  // A key event from the screen view. Returns the keysym sent, or 0 when the key is left to the
+  // input method (Hangul and other composed text arrive whole through screenTypeText).
+  function screenKeyEvent(event, down) {
+    event.accepted = true
+    if (!screenMine || event.isAutoRepeat) return 0
+    if (!down) {
+      var held = screenHeld[event.key]
+      if (held === undefined) return 0
+      delete screenHeld[event.key]
+      sendScreenKey(held, false)
+      return held
+    }
+    var sym = keysymFor(event)
+    var chord = (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) !== 0
+    if (sym === 0 || (sym >= 0x01000000 && !chord)) {
+      event.accepted = false
+      return 0
+    }
+    screenHeld[event.key] = sym
+    sendScreenKey(sym, true)
+    return sym
+  }
+  // Committed text (an input method's syllables, a paste) typed as Unicode keysyms.
+  function screenTypeText(text) {
+    if (!screenMine) return
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i)
+      var sym = c === 10 ? 0xff0d : c < 0x100 ? c : 0x01000000 + c
+      sendScreenKey(sym, true)
+      sendScreenKey(sym, false)
+    }
+  }
+  function releaseScreenKeys() {
+    for (var k in screenHeld) sendScreenKey(screenHeld[k], false)
+    screenHeld = ({})
+  }
   // X keysym for a Qt key event; 0 when there is none to send.
   function keysymFor(event) {
     var k = event.key
@@ -1524,7 +1562,7 @@ Panel {
       var f = root.screenFrame
       return JSON.stringify({ showing: root.showingScreen, seq: f ? f.seq : 0, w: f ? f.w : 0, h: f ? f.h : 0, note: root.screenNote,
         mine: root.screenMine, painted: [Math.round(screenImage.paintedWidth), Math.round(screenImage.paintedHeight)],
-        focus: screenView.activeFocus })
+        focus: screenKeys.activeFocus })
     }
     // Test hooks: a click at a fraction of the drawn frame, and typing, through the same paths as the mouse and keys.
     function screenTap(fx: real, fy: real): string {
@@ -1542,13 +1580,16 @@ Panel {
       return "answered"
     }
     function screenType(text: string): string {
-      for (var i = 0; i < text.length; i++) {
-        var c = text.charCodeAt(i)
-        var sym = c === 10 ? 0xff0d : c < 0x100 ? c : 0x01000000 + c
-        root.sendScreenKey(sym, true)
-        root.sendScreenKey(sym, false)
-      }
-      return "typed"
+      root.screenTypeText(text)
+      return root.screenMine ? "typed" : "not-in-control"
+    }
+    // Runs a key through the same handler the keyboard uses: press then release. Returns the keysym
+    // sent as hex, or "ime" when the key is left to the input method.
+    function screenKeyTest(key: int, text: string, modifiers: int): string {
+      var press = { key: key, text: text, modifiers: modifiers, isAutoRepeat: false, accepted: false }
+      var sym = root.screenKeyEvent(press, true)
+      root.screenKeyEvent({ key: key, text: text, modifiers: modifiers, isAutoRepeat: false, accepted: false }, false)
+      return sym === 0 ? (press.accepted ? "ignored" : "ime") : "0x" + sym.toString(16)
     }
     function setEffort(level: string): string { return root.setEffort(level) ? "setting" : "invalid" }
     function effort(): string { return root.effortByProfile[root.selected] || "" }
@@ -1886,7 +1927,7 @@ Panel {
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
         || importPathField.activeFocus || importNameField.activeFocus || groupNameField.activeFocus || roomInput.activeFocus
-        || roomRenameField.activeFocus || screenView.activeFocus
+        || roomRenameField.activeFocus || screenKeys.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -3450,7 +3491,6 @@ Panel {
         anchors.bottom: footer.top
         anchors.bottomMargin: Style.space(8)
         width: parent.width
-        property var held: ({})
         property var pendingMove: null
 
         function framePoint(mx, my) {
@@ -3485,7 +3525,7 @@ Panel {
           width: screenImage.paintedWidth + 2
           height: screenImage.paintedHeight + 2
           color: "transparent"
-          border.color: screenView.activeFocus ? Color.accent : root.dim
+          border.color: screenKeys.activeFocus ? Color.accent : root.dim
           border.width: 1
         }
 
@@ -3517,7 +3557,7 @@ Panel {
           hoverEnabled: true
           acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
           onPressed: (mouse) => {
-            screenView.forceActiveFocus()
+            screenKeys.forceActiveFocus()
             screenView.pointer(mouse.x, mouse.y, screenView.buttonMask(mouse.buttons))
           }
           onReleased: (mouse) => screenView.pointer(mouse.x, mouse.y, screenView.buttonMask(mouse.buttons))
@@ -3535,26 +3575,42 @@ Panel {
           }
         }
 
-        Keys.onPressed: (event) => {
-          event.accepted = true
-          if (event.isAutoRepeat || !root.screenMine) return
-          var sym = root.keysymFor(event)
-          if (sym === 0) return
-          held[event.key] = sym
-          root.sendScreenKey(sym, true)
+        // Takes the keyboard while the screen is driven. A text field rather than a plain item, so an
+        // input method (Korean and the like) can compose here and hand over finished characters.
+        TextInput {
+          id: screenKeys
+          width: 1
+          height: 1
+          opacity: 0
+          Keys.onPressed: (event) => root.screenKeyEvent(event, true)
+          Keys.onReleased: (event) => root.screenKeyEvent(event, false)
+          onTextEdited: if (!inputMethodComposing && text !== "") {
+            root.screenTypeText(text)
+            text = ""
+          }
+          // Keys still down when focus leaves would stay pressed on the bot's screen.
+          onActiveFocusChanged: if (!activeFocus) root.releaseScreenKeys()
         }
-        Keys.onReleased: (event) => {
-          event.accepted = true
-          if (event.isAutoRepeat) return
-          var sym = held[event.key]
-          if (sym === undefined) return
-          delete held[event.key]
-          root.sendScreenKey(sym, false)
-        }
-        // Keys still down when focus leaves would stay pressed on the bot's screen.
-        onActiveFocusChanged: if (!activeFocus) {
-          for (var k in held) root.sendScreenKey(held[k], false)
-          held = ({})
+
+        // What the input method is composing, until it is committed and typed on the bot's screen.
+        Rectangle {
+          visible: screenKeys.preeditText !== ""
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.bottom: parent.bottom
+          anchors.bottomMargin: Style.space(12)
+          width: preeditLabel.implicitWidth + Style.space(16)
+          height: preeditLabel.implicitHeight + Style.space(8)
+          radius: Style.cornerRadius
+          color: root.alpha(root.foreground, 0.85)
+
+          Text {
+            id: preeditLabel
+            anchors.centerIn: parent
+            text: screenKeys.preeditText
+            color: Color.background
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
         }
       }
 
