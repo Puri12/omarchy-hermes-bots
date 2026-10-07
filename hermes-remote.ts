@@ -57,6 +57,7 @@ type Command =
   | { cmd: "model"; profile: string; provider: string; model: string }
   | { cmd: "effort.get"; profile: string }
   | { cmd: "yolo"; profile: string; on: boolean }
+  | { cmd: "context"; profile: string }
   | { cmd: "subagents"; profile: string }
   | { cmd: "subagent.steer"; profile: string; id: string; text: string }
   | { cmd: "subagent.stop"; profile: string; id: string }
@@ -1475,6 +1476,18 @@ class Remote {
     this.out({ ev: "effort", profile, value: String(r.value ?? "") });
   }
 
+  // What fills the open chat's context window, by kind (system prompt, tools, skills, memory, ...).
+  async contextBreakdown(profile: string) {
+    const sid = this.sessionByProfile.get(profile);
+    if (!sid) return this.out({ ev: "context", profile, categories: [], max: 0, used: 0, percent: 0, estimated: false });
+    const r = await this.rpc("session.context_breakdown", { session_id: sid });
+    this.out({ ev: "context", profile,
+      categories: ((r.categories as Json[] | undefined) ?? []).map((c) => ({ id: String(c.id ?? ""), label: String(c.label ?? c.id ?? ""),
+        tokens: Number(c.tokens ?? 0) })),
+      max: Number(r.context_max ?? 0), used: Number(r.context_used ?? 0), percent: Number(r.context_percent ?? 0),
+      estimated: r.context_estimated === true });
+  }
+
   // Skip approvals for this chat only (session-scoped YOLO). Without a session the server would flip
   // a process-wide flag for every bot, so a chat is opened first.
   async yoloSet(profile: string, on: boolean) {
@@ -2195,6 +2208,7 @@ class Remote {
       case "model": return this.setModel(c.profile, c.provider, c.model);
       case "effort.get": return this.effortGet(c.profile);
       case "yolo": return this.yoloSet(c.profile, c.on);
+      case "context": return this.contextBreakdown(c.profile);
       case "subagents": return this.subagentList(c.profile);
       case "subagent.steer": return this.subagentSteer(c.profile, c.id, c.text);
       case "subagent.stop": return this.subagentStop(c.profile, c.id);

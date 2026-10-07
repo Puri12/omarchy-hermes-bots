@@ -140,6 +140,18 @@ Panel {
   property var unreadProfiles: ({})
   // Server notices (credits, slow start, rate limit / fallback) keyed like Hermes Desktop toasts.
   property var notices: ({})
+  // Context window breakdown of the selected chat, opened from the model line.
+  property var contextByProfile: ({})
+  property bool showingContext: false
+  readonly property var contextColors: ({ system_prompt: "#7aa2f7", tool_definitions: "#e0af68", rules: "#9ece6a",
+    skills: "#bb9af7", mcp: "#7dcfff", subagent_definitions: "#f7768e", memory: "#73daca", conversation: "#c0caf5" })
+  function toggleContext() {
+    showingContext = !showingContext
+    if (showingContext) sendCommand({ cmd: "context", profile: selected })
+  }
+  function shortTokens(n) {
+    return n >= 1000000 ? (n / 1000000).toFixed(1) + "M" : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n)
+  }
   // Bots whose open chat skips approvals (YOLO). Session-scoped on the server: a new chat starts off.
   property var yoloByProfile: ({})
   function setYolo(on) {
@@ -493,6 +505,7 @@ Panel {
     if (draftOwner === "default" || profiles.some(function(p) { return p.name === draftOwner })) draftByProfile[draftOwner] = input.text
     draftOwner = selected
     closeScreen()
+    if (showingContext) sendCommand({ cmd: "context", profile: selected })
     steerWorker = ""
     input.text = draftByProfile[selected] || ""
     input.cursorPosition = input.text.length
@@ -661,6 +674,10 @@ Panel {
       break
     case "session":
       sessionOwner[ev.session] = ev.profile
+      break
+    case "context":
+      contextByProfile[ev.profile] = ev
+      revision++
       break
     case "yolo":
       if (ev.on) yoloByProfile[ev.profile] = ev.session
@@ -1849,6 +1866,8 @@ Panel {
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
     // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    function contextView(): string { root.toggleContext(); return root.showingContext ? "shown" : "hidden" }
+    function context(): string { return JSON.stringify(root.contextByProfile[root.selected] || null) }
     function setYolo(on: bool): string { return root.setYolo(on) ? "setting" : "invalid" }
     function yolo(): string { return root.yoloByProfile[root.selected] ? "on" : "off" }
     function artifactsView(): string { root.toggleArtifacts(); return root.showingArtifacts ? "shown" : "hidden" }
@@ -2271,6 +2290,69 @@ Panel {
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+
+            // Click for what fills the context window.
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.toggleContext()
+            }
+          }
+
+          Column {
+            id: contextBreakdown
+            readonly property var info: { root.revision; return root.contextByProfile[root.selected] || null }
+            readonly property real biggest: {
+              var m = 1
+              if (info) for (var i = 0; i < info.categories.length; i++) m = Math.max(m, info.categories[i].tokens)
+              return m
+            }
+            visible: root.showingContext
+            width: parent.width
+            spacing: Style.space(2)
+
+            Text {
+              text: !contextBreakdown.info ? "Reading the context…"
+                : contextBreakdown.info.categories.length === 0 ? "No open chat yet"
+                : "context " + contextBreakdown.info.percent + "%  ·  " + root.shortTokens(contextBreakdown.info.used) + " of "
+                  + root.shortTokens(contextBreakdown.info.max) + (contextBreakdown.info.estimated ? "  ·  estimated" : "")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Repeater {
+              model: contextBreakdown.info ? contextBreakdown.info.categories : []
+              Row {
+                required property var modelData
+                width: contextBreakdown.width
+                spacing: Style.space(6)
+
+                Text {
+                  width: Style.space(150)
+                  text: modelData.label
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Rectangle {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.max(2, (contextBreakdown.width - Style.space(220)) * modelData.tokens / contextBreakdown.biggest)
+                  height: Style.space(8)
+                  radius: 2
+                  color: root.contextColors[modelData.id] || root.dim
+                }
+
+                Text {
+                  text: root.shortTokens(modelData.tokens)
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
           }
 
           Flow {
