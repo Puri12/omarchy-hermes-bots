@@ -59,6 +59,9 @@ type Command =
   | { cmd: "yolo"; profile: string; on: boolean }
   | { cmd: "context"; profile: string }
   | { cmd: "caps.get"; profile: string }
+  | { cmd: "avatar.get"; profile: string }
+  | { cmd: "avatar.set"; profile: string; path: string }
+  | { cmd: "avatar.clear"; profile: string }
   | { cmd: "caps.set"; profile: string; part: "toolsets" | "skills" | "mcp"; names: string[] }
   | { cmd: "subagents"; profile: string }
   | { cmd: "subagent.steer"; profile: string; id: string; text: string }
@@ -1478,6 +1481,33 @@ class Remote {
     this.out({ ev: "effort", profile, value: String(r.value ?? "") });
   }
 
+  // The bot's avatar (profile asset), cached locally for the panel; "" when it has none.
+  async avatarGet(profile: string) {
+    await this.requireProfile(profile);
+    const r = await this.rpc("profiles.get_asset", { name: profile, asset: "avatar" });
+    if (r.found !== true) return this.out({ ev: "avatar", profile, local: "" });
+    const mime = String(r.mime ?? "image/png");
+    const local = await saveCache("avatars", decodeDataUrl(String(r.data ?? "")),
+      mime.includes("jpeg") ? ".jpg" : mime.includes("webp") ? ".webp" : ".png");
+    this.out({ ev: "avatar", profile, local });
+  }
+
+  async avatarSet(profile: string, path: string) {
+    await this.requireProfile(profile);
+    const file = await readAttachFile(path);
+    if (!/^image\/(png|jpeg|webp)$/.test(file.mime)) throw new RemoteError("an avatar must be a PNG, JPEG or WebP image");
+    if (file.bytes.length > 2_000_000) throw new RemoteError("an avatar must be 2 MB or less");
+    await this.rpc("profiles.set_asset", { name: profile, asset: "avatar",
+      data: `data:${file.mime};base64,${Buffer.from(file.bytes).toString("base64")}` });
+    await this.avatarGet(profile);
+  }
+
+  async avatarClear(profile: string) {
+    await this.requireProfile(profile);
+    await this.rpc("profiles.set_asset", { name: profile, asset: "avatar", clear: true });
+    this.out({ ev: "avatar", profile, local: "" });
+  }
+
   // What a bot may use: tool sets, MCP servers and its installed skills (the Hermes Desktop editor's view).
   async capsGet(profile: string) {
     await this.requireProfile(profile);
@@ -2235,6 +2265,9 @@ class Remote {
       case "yolo": return this.yoloSet(c.profile, c.on);
       case "context": return this.contextBreakdown(c.profile);
       case "caps.get": return this.capsGet(c.profile);
+      case "avatar.get": return this.avatarGet(c.profile);
+      case "avatar.set": return this.avatarSet(c.profile, c.path);
+      case "avatar.clear": return this.avatarClear(c.profile);
       case "caps.set": return this.capsSet(c.profile, c.part, c.names);
       case "subagents": return this.subagentList(c.profile);
       case "subagent.steer": return this.subagentSteer(c.profile, c.id, c.text);

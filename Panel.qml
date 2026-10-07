@@ -505,6 +505,7 @@ Panel {
     if (draftOwner === "default" || profiles.some(function(p) { return p.name === draftOwner })) draftByProfile[draftOwner] = input.text
     draftOwner = selected
     closeScreen()
+    if (avatarByProfile[selected] === undefined) sendCommand({ cmd: "avatar.get", profile: selected })
     if (showingContext) sendCommand({ cmd: "context", profile: selected })
     steerWorker = ""
     input.text = draftByProfile[selected] || ""
@@ -674,6 +675,10 @@ Panel {
       break
     case "session":
       sessionOwner[ev.session] = ev.profile
+      break
+    case "avatar":
+      avatarByProfile[ev.profile] = ev.local
+      revision++
       break
     case "caps":
       capsByProfile[ev.profile] = ev
@@ -1492,6 +1497,18 @@ Panel {
   function refreshProfile() {
     sendCommand({ cmd: "profile.get", profile: selected })
     sendCommand({ cmd: "caps.get", profile: selected })
+    sendCommand({ cmd: "avatar.get", profile: selected })
+  }
+
+  // Local copies of bots' avatars ("" = none), fetched the first time a bot is shown.
+  property var avatarByProfile: ({})
+  readonly property string selectedAvatar: { revision; return avatarByProfile[selected] || "" }
+  function setAvatar(path) {
+    var p = String(path || "").trim()
+    if (p === "" || !selectedProfile) return false
+    lastError = ""
+    sendCommand({ cmd: "avatar.set", profile: selected, path: p })
+    return true
   }
 
   // Tool sets, MCP servers and skills each bot may use, as profiles.describe reports them.
@@ -1893,6 +1910,9 @@ Panel {
     function routineDelete(id: string): string { return root.routineCommand("delete", id) ? "deleting" : "invalid" }
     // Shows the Routines section (and a routine's run history) the same way its buttons do; used for captures.
     // Test hook: the drop handler with these paths (comma separated), as if dragged in.
+    function setAvatar(path: string): string { return root.setAvatar(path) ? "setting" : "invalid" }
+    function clearAvatar(): string { root.sendCommand({ cmd: "avatar.clear", profile: root.selected }); return "clearing" }
+    function avatar(): string { return root.selectedAvatar }
     function caps(): string { return JSON.stringify(root.capsByProfile[root.selected] || null) }
     function toggleCap(part: string, name: string): string { return root.toggleCap(part, name) ? "setting" : "invalid" }
     function contextView(): string { root.toggleContext(); return root.showingContext ? "shown" : "hidden" }
@@ -2146,6 +2166,7 @@ Panel {
         || routineNameField.activeFocus || routineScheduleField.activeFocus || routinePromptField.activeFocus
         || editDescField.activeFocus || soulArea.activeFocus || duplicateField.activeFocus
         || importPathField.activeFocus || importNameField.activeFocus || groupNameField.activeFocus || roomInput.activeFocus
+        || avatarField.activeFocus
         || roomRenameField.activeFocus || screenKeys.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -2307,6 +2328,19 @@ Panel {
           Text {
             width: parent.width
             elide: Text.ElideRight
+            // The bot's avatar, when it has one, sits in front of the model line.
+            leftPadding: root.selectedAvatar !== "" ? Style.space(24) : 0
+
+            Image {
+              visible: root.selectedAvatar !== ""
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(18)
+              height: Style.space(18)
+              source: root.selectedAvatar !== "" ? "file://" + root.selectedAvatar : ""
+              fillMode: Image.PreserveAspectCrop
+              sourceSize.width: Style.space(36)
+            }
+
             text: {
               root.revision
               var u = root.usageByProfile[root.selected]
@@ -3492,6 +3526,60 @@ Panel {
                   fontFamily: root.fontFamily
                   fontSize: Style.font.caption
                   onClicked: root.setProfileFlag("hidden", !(root.selectedInfo && root.selectedInfo.hidden))
+                }
+              }
+
+              PanelSectionHeader {
+                topPadding: Style.space(8)
+                text: "AVATAR"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Image {
+                  width: Style.space(44)
+                  height: Style.space(44)
+                  visible: root.selectedAvatar !== ""
+                  source: root.selectedAvatar !== "" ? "file://" + root.selectedAvatar : ""
+                  fillMode: Image.PreserveAspectCrop
+                  sourceSize.width: Style.space(88)
+                }
+
+                TextField {
+                  id: avatarField
+                  width: parent.width - avatarSet.width - avatarClear.width - parent.spacing * 3
+                    - (root.selectedAvatar !== "" ? Style.space(44) + parent.spacing : 0)
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "image path (PNG, JPEG, WebP, up to 2 MB)"
+                  foreground: root.foreground
+                  onAccepted: if (root.setAvatar(text)) text = ""
+                }
+
+                Button {
+                  id: avatarSet
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Set"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: if (root.setAvatar(avatarField.text)) avatarField.text = ""
+                }
+
+                Button {
+                  id: avatarClear
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: root.selectedAvatar !== ""
+                  text: "Remove"
+                  bordered: true
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.sendCommand({ cmd: "avatar.clear", profile: root.selected })
                 }
               }
 
