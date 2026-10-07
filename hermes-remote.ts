@@ -55,6 +55,8 @@ type Command =
   | { cmd: "approve"; requestId: string | number; choice: Choice }
   | { cmd: "clarify"; requestId: string | number; answer: string; questionId?: string }
   | { cmd: "model"; profile: string; provider: string; model: string }
+  | { cmd: "effort.get"; profile: string }
+  | { cmd: "effort.set"; profile: string; value: string }
   | { cmd: "attach"; profile: string; path?: string; clipboard?: boolean }
   | { cmd: "sessions"; profile: string }
   | { cmd: "skills"; profile: string }
@@ -86,6 +88,8 @@ const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`/g;
 // Anything else in a MEDIA: tag (pdf, csv, zip, ...) is fetched as a plain file download.
 const IMAGE_PATH_RE = /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i;
 const CRON_POLL_MS = 30000;
+// hermes_constants.VALID_REASONING_EFFORTS plus "none" (thinking off).
+const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const ROOM_WATCH_MS = 20000;
 const NOVNC_DIR = `${import.meta.dir}/novnc`;
 const SOCKET_PATH = process.env.XDG_RUNTIME_DIR
@@ -1327,6 +1331,26 @@ class Remote {
     emit(await this.status());
   }
 
+  // Reasoning effort. An open chat reports what its agent runs with; without one the bot's
+  // config.yaml answers.
+  async effortGet(profile: string) {
+    await this.requireProfile(profile);
+    const sid = this.sessionByProfile.get(profile);
+    const r = await this.rpc("config.get", { key: "reasoning", ...(sid ? { session_id: sid } : {}), ...this.profileParam(profile) });
+    emit({ ev: "effort", profile, value: String(r.value ?? "") });
+  }
+
+  // scope "global" writes agent.reasoning_effort into this bot's config.yaml (the profile param
+  // picks whose) and also switches the open chat's agent, so the choice outlives a new chat.
+  async effortSet(profile: string, value: string) {
+    await this.requireProfile(profile);
+    if (!EFFORT_LEVELS.includes(value)) throw new RemoteError(`unknown reasoning effort: ${value}`);
+    const sid = this.sessionByProfile.get(profile);
+    await this.rpc("config.set", { key: "reasoning", value, scope: "global",
+      ...(sid ? { session_id: sid } : {}), ...this.profileParam(profile) });
+    emit({ ev: "effort", profile, value, changed: true });
+  }
+
   // Bot Screen. The display ticket and viewer_id come from display.observe on this helper's /api/ws,
   // so take/hand back must run here too; the page only talks to the loopback server below.
   private screenServer: ReturnType<typeof Bun.serve> | null = null;
@@ -1706,6 +1730,8 @@ class Remote {
       case "approve": return this.approve(c.requestId, c.choice);
       case "clarify": return this.answerClarify(c.requestId, c.answer, c.questionId);
       case "model": return this.setModel(c.profile, c.provider, c.model);
+      case "effort.get": return this.effortGet(c.profile);
+      case "effort.set": return this.effortSet(c.profile, c.value);
       case "attach": return this.attach(c.profile, { path: c.path, clipboard: c.clipboard });
       case "sessions": return this.listSessions(c.profile);
       case "open": return this.openSession(c.profile, c.session);

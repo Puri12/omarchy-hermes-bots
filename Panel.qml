@@ -48,6 +48,14 @@ Panel {
   property var unreadProfiles: ({})
   // Server notices (credits, slow start, rate limit / fallback) keyed like Hermes Desktop toasts.
   property var notices: ({})
+  // Reasoning effort each bot runs with, as the server last reported it.
+  property var effortByProfile: ({})
+  readonly property var effortLevels: ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+  function setEffort(level) {
+    if (effortLevels.indexOf(level) < 0 || !selectedProfile) return false
+    sendCommand({ cmd: "effort.set", profile: selected, value: level })
+    return true
+  }
   // Delegated children per bot: {profile: {subagentId: {goal, tool, count, done}}}.
   property var subagentsByProfile: ({})
   property bool recording: false
@@ -330,6 +338,7 @@ Panel {
     routineRunsShown = ""
     armedRoutine = ""
     ensureLoaded(selected)
+    sendCommand({ cmd: "effort.get", profile: selected })
     refreshSkills()
     if (showingRoutines) refreshRoutines()
     if (editing) refreshProfile()
@@ -461,6 +470,7 @@ Panel {
       loadedProfiles = ({})
       sendCommand({ cmd: "refresh" })
       ensureLoaded(selected)
+      sendCommand({ cmd: "effort.get", profile: selected })
       break
     case "role":
       primaryClient = ev.primary === true
@@ -479,6 +489,11 @@ Panel {
       break
     case "session":
       sessionOwner[ev.session] = ev.profile
+      break
+    case "effort":
+      effortByProfile[ev.profile] = ev.value
+      revision++
+      if (ev.changed) pushMessage(ev.profile, "tool", "reasoning → " + ev.value)
       break
     case "sent":
       sessionOwner[ev.session] = ev.profile
@@ -1164,7 +1179,10 @@ Panel {
   }
 
   function toggleModelPicker() {
-    if (!pickingModel) closeDrawers("model")
+    if (!pickingModel) {
+      closeDrawers("model")
+      sendCommand({ cmd: "effort.get", profile: selected })
+    }
     pickingModel = !pickingModel
   }
 
@@ -1375,6 +1393,8 @@ Panel {
     function newChat(): string { return root.newChat() ? "cleared" : "busy" }
     function answer(text: string): string { return root.answerClarify(text) ? "answered" : "no-question" }
     function setModel(model: string): string { return root.setModel(model) ? "setting" : "invalid" }
+    function setEffort(level: string): string { return root.setEffort(level) ? "setting" : "invalid" }
+    function effort(): string { return root.effortByProfile[root.selected] || "" }
     function geometry(): string {
       if (!root.opened) return "closed"
       var p = keyCatcher.mapToItem(null, 0, 0)
@@ -1864,7 +1884,9 @@ Panel {
             text: {
               root.revision
               var u = root.usageByProfile[root.selected]
+              var effort = root.effortByProfile[root.selected]
               return (root.selectedProfile ? "model · " + root.selectedProfile.model : "")
+                + (effort ? "  ·  reasoning " + effort : "")
                 + (u ? "  ·  context " + u.contextPercent + "%  ·  " + (u.total >= 1000 ? (u.total / 1000).toFixed(1) + "k" : u.total) + " tokens" : "")
             }
             color: root.dim
@@ -3111,6 +3133,31 @@ Panel {
                   onAccepted: { root.setModel(text); text = "" }
                 }
               }
+
+              PanelSectionHeader {
+                text: "REASONING"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Flow {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Repeater {
+                  model: root.effortLevels
+                  Button {
+                    required property var modelData
+                    text: modelData
+                    selected: { root.revision; return root.effortByProfile[root.selected] === modelData }
+                    bordered: true
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.setEffort(modelData)
+                  }
+                }
+              }
             }
 
             Column {
@@ -3864,7 +3911,7 @@ Panel {
             id: modelButton
             height: sendButton.height
             iconText: "󰧑"
-            tooltipText: "Model" + (root.selectedProfile ? ": " + root.selectedProfile.model : "")
+            tooltipText: "Model and reasoning" + (root.selectedProfile ? ": " + root.selectedProfile.model : "")
             bordered: true
             selected: root.pickingModel
             foreground: root.foreground
