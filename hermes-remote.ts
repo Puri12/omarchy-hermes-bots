@@ -57,6 +57,7 @@ type Command =
   | { cmd: "model"; profile: string; provider: string; model: string }
   | { cmd: "effort.get"; profile: string }
   | { cmd: "yolo"; profile: string; on: boolean }
+  | { cmd: "server.remove"; id: string }
   | { cmd: "context"; profile: string }
   | { cmd: "caps.get"; profile: string }
   | { cmd: "avatar.get"; profile: string }
@@ -541,6 +542,12 @@ class Remote {
   out: (ev: Json) => void = (ev) => emit(ev);
   // The roster name of one of this server's bots (differs from its own name on an extra server).
   alias: (profile: string) => string = (profile) => profile;
+
+  // Drops the gateway connection for good (the server was taken out of the panel).
+  close() {
+    this.out = () => {};
+    this.ws?.close();
+  }
 
   private auth(): Record<string, string> {
     return this.creds.token ? { "X-Hermes-Session-Token": this.creds.token } : { Cookie: this.cookie };
@@ -2373,8 +2380,13 @@ class Hub {
       const ok = st !== undefined && !this.down.has(s.id);
       servers.push({ id: s.id, label: s.label, ok });
       if (!ok) continue;
-      for (const p of (st.profiles as Json[] | undefined) ?? [])
-        profiles.push({ ...p, name: this.shownName(s, String(p.name)), isDefault: false, server: s.id, serverLabel: s.label });
+      for (const p of (st.profiles as Json[] | undefined) ?? []) {
+        const own = String(p.name);
+        // display: the roster button under the server's heading; title: the name in "@..." texts.
+        profiles.push({ ...p, name: this.shownName(s, own), isDefault: false, server: s.id, serverLabel: s.label,
+          serverDefault: own === "default", display: own === "default" ? s.label : own,
+          title: own === "default" ? s.label : `${s.label}/${own}` });
+      }
     }
     const base = mainStatus ?? [...this.statusBy.values()][0] ?? {};
     return { ...base, ev: "status", ok: true, profiles, servers, sections: this.sections ?? base.sections, mainOff: this.mainDown };
@@ -2431,6 +2443,22 @@ class Hub {
     }), now);
   }
 
+  // Takes an extra server out of the panel (its bots keep running there) and out of servers.json.
+  private async removeServer(id: string) {
+    const s = this.extras.find((x) => x.id === id);
+    if (!s) throw new RemoteError(`no server named ${id} in the panel`);
+    let list: Json[] = [];
+    try { list = JSON.parse(await Bun.file(serversPath).text()) as Json[]; } catch { list = []; }
+    const kept = (Array.isArray(list) ? list : []).filter((x) => String(x.id ?? "").trim().toLowerCase() !== id);
+    writeFileSync(serversPath, `${JSON.stringify(kept, null, 2)}\n`, { mode: 0o600 });
+    this.extras = this.extras.filter((x) => x !== s);
+    this.statusBy.delete(id);
+    this.down.delete(id);
+    s.remote.close();
+    emit({ ev: "server.removed", id, label: s.label });
+    emit(this.merged());
+  }
+
   clientGone(client: number) {
     for (const r of [this.main, ...this.extras.map((s) => s.remote)]) r.embedClientGone(client);
   }
@@ -2453,6 +2481,7 @@ class Hub {
       for (const s of this.extras) this.refreshExtra(s, c, now);
       return;
     }
+    if (c.cmd === "server.remove") return this.enqueue("", "", () => this.removeServer(c.id));
     if (c.cmd === "speak.stop") {
       for (const r of [this.main, ...this.extras.map((s) => s.remote)]) void r.handle(c);
       return;

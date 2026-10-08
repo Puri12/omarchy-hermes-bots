@@ -345,9 +345,8 @@ Panel {
 
   // The roster as drawn: one group per section in order, then the bots in none. Pinned bots lead
   // each group; hidden bots only with "Show hidden".
-  readonly property var rosterGroups: {
-    var shown = profiles.filter(function(p) { return showHidden || !p.hidden })
-    var ordered = shown.filter(function(p) { return p.pinned }).concat(shown.filter(function(p) { return !p.pinned }))
+  // Bots by section, in section order; the ones in no section last.
+  function sectionGroups(ordered) {
     var groups = sectionOrder.map(function(s) {
       return { name: s, bots: ordered.filter(function(p) { return root.sectionOf(p.name) === s }) }
     }).filter(function(g) { return g.bots.length > 0 })
@@ -355,6 +354,28 @@ Panel {
     // The bots in no section get a heading only when there are sections above them.
     if (rest.length > 0 || groups.length === 0) groups.push({ name: groups.length > 0 ? "Unassigned" : "", bots: rest })
     return groups
+  }
+  // With bots from more than one server, each server gets its own heading (sections nest under it).
+  readonly property var rosterGroups: {
+    var shown = profiles.filter(function(p) { return showHidden || !p.hidden })
+    var ordered = shown.filter(function(p) { return p.pinned }).concat(shown.filter(function(p) { return !p.pinned }))
+    var servers = [{ id: "", label: "Server" }]
+    ordered.forEach(function(p) {
+      if (p.server && !servers.some(function(s) { return s.id === p.server })) servers.push({ id: p.server, label: p.serverLabel || p.server })
+    })
+    if (servers.length === 1) return sectionGroups(ordered)
+    var groups = []
+    servers.forEach(function(s) {
+      var mine = ordered.filter(function(p) { return (p.server || "") === s.id })
+      if (mine.length === 0) return
+      sectionGroups(mine).forEach(function(g) { groups.push({ name: g.name ? s.label + "  ·  " + g.name : s.label, bots: g.bots }) })
+    })
+    return groups
+  }
+  // How a bot is named in text ("@..."): another server's bots carry that server's label.
+  function botLabel(name) {
+    for (var i = 0; i < profiles.length; i++) if (profiles[i].name === name) return profiles[i].title || name
+    return name
   }
   readonly property var rosterProfiles: {
     var all = []
@@ -661,8 +682,10 @@ Panel {
       break
     case "status":
       // With several servers a status can arrive while the main one is away; its bots are then offline.
+      // A routine refresh must not wipe an error the person has not read yet; only a reconnect does.
+      var wasConnected = connected
       connected = ev.mainOff !== true
-      if (connected) lastError = ""
+      if (connected && !wasConnected) lastError = ""
       profiles = ev.profiles || []
       sectionOrder = ev.sections ? ev.sections.order : []
       sectionByBot = ev.sections ? ev.sections.assign : ({})
@@ -767,7 +790,7 @@ Panel {
       } else {
         demoProfile = ""
         if (ev.steps.length === 0) lastError = "no demonstration steps were recorded"
-        else if (busyProfiles[ev.profile]) lastError = "@" + ev.profile + " is busy; the demonstration was not sent"
+        else if (busyProfiles[ev.profile]) lastError = "@" + botLabel(ev.profile) + " is busy; the demonstration was not sent"
         else {
           teachProfile = ev.profile
           sendTextForProfile(ev.profile, teachPrompt(ev.steps), [], [])
@@ -779,7 +802,7 @@ Panel {
       if (skillDraft && skillDraft.profile === ev.profile && skillDraft.name === ev.name) skillDraft = null
       break
     case "screen.error":
-      lastError = "@" + ev.profile + " screen: " + ev.message
+      lastError = "@" + botLabel(ev.profile) + " screen: " + ev.message
       if (showingScreen && ev.profile === screenProfile) screenNote = ev.message
       break
     case "screen.frame":
@@ -957,7 +980,7 @@ Panel {
       pushMessage(ev.profile, "tool", "⏱ " + ev.job + " · " + Qt.formatTime(when, "HH:mm")
         + (ev.status && ev.status !== "ok" ? " · " + ev.status + (ev.error ? ": " + ev.error : "") : ""))
       if (ev.text) pushMessage(ev.profile, "bot", ev.text)
-      if (ev.notify) notify("@" + ev.profile + " · " + ev.job, ev.text || ev.error || ev.status, ev.profile)
+      if (ev.notify) notify("@" + botLabel(ev.profile) + " · " + ev.job, ev.text || ev.error || ev.status, ev.profile)
       if (showingRoutines && (routinesAll || ev.profile === selected)) refreshRoutines()
       break
     case "attached":
@@ -1002,7 +1025,7 @@ Panel {
       var asker = profileForSession(ev.session)
       for (var qi = 0; qi < ev.questions.length; qi++) pushMessage(asker, "tool", "❓ " + ev.questions[qi].question)
       if (busyProfiles[asker]) setActivity(asker, "❓ waiting for your answer")
-      notify("@" + asker + " asks", ev.questions.length > 0 ? ev.questions[0].question : "", asker, "critical")
+      notify("@" + botLabel(asker) + " asks", ev.questions.length > 0 ? ev.questions[0].question : "", asker, "critical")
       if (opened && asker === selected) Qt.callLater(function() { clarifyField.forceActiveFocus() })
       break
     case "request.cancel":
@@ -1045,7 +1068,7 @@ Panel {
         pushMessage(owner, "tool", "■ stopped")
       } else {
         if (!streamed) pushMessage(owner, "bot", finished)
-        notify("@" + owner + " replied", displayText(finished), owner)
+        notify("@" + botLabel(owner) + " replied", displayText(finished), owner)
       }
       if (teachProfile === owner) {
         teachProfile = ""
@@ -1054,7 +1077,7 @@ Panel {
           draft.profile = owner
           skillDraft = draft
         } else if (finished !== "") {
-          lastError = "@" + owner + " did not reply with a SKILL.md to save"
+          lastError = "@" + botLabel(owner) + " did not reply with a SKILL.md to save"
         }
       }
       setBusy(owner, false)
@@ -1063,7 +1086,7 @@ Panel {
     case "approval":
       approval = ev
       if (busyProfiles[profileForSession(ev.session)]) setActivity(profileForSession(ev.session), "❓ waiting for your approval")
-      notify("@" + profileForSession(ev.session) + " needs approval", ev.description || ev.command,
+      notify("@" + botLabel(profileForSession(ev.session)) + " needs approval", ev.description || ev.command,
         profileForSession(ev.session), "critical")
       break
     case "created":
@@ -1589,6 +1612,23 @@ Panel {
     descField.text = ""
   }
 
+  // Same two-click guard as a bot delete; the server id goes to the helper, which edits servers.json.
+  function requestServerRemove(id) {
+    if (!id) return false
+    var key = "server:" + id
+    if (armedDelete !== key) {
+      armedDelete = key
+      armedAt = Date.now()
+      disarmTimer.restart()
+      return false
+    }
+    if (Date.now() - armedAt < 800) return false
+    armedDelete = ""
+    disarmTimer.stop()
+    sendCommand({ cmd: "server.remove", id: id })
+    return true
+  }
+
   function requestDelete(name) {
     if (!name || name === "default") return false
     if (armedDelete !== name) {
@@ -1921,11 +1961,13 @@ Panel {
       if (!root.opened) root.open()
       root.followChat()
       Qt.callLater(function() { input.forceActiveFocus() })
-      return "@" + root.selected
+      return "@" + root.botLabel(root.selected)
     }
     function setAvatar(path: string): string { return root.setAvatar(path) ? "setting" : "invalid" }
     function clearAvatar(): string { root.sendCommand({ cmd: "avatar.clear", profile: root.selected }); return "clearing" }
     function avatar(): string { return root.selectedAvatar }
+    function removeServer(id: string): string { return root.requestServerRemove(id) ? "removing" : "armed" }
+    function roster(): string { return JSON.stringify(root.rosterGroups.map(function(g) { return { name: g.name, bots: g.bots.map(function(p) { return p.display || p.name }) } })) }
     function caps(): string { return JSON.stringify(root.capsByProfile[root.selected] || null) }
     function toggleCap(part: string, name: string): string { return root.toggleCap(part, name) ? "setting" : "invalid" }
     function contextView(): string { root.toggleContext(); return root.showingContext ? "shown" : "hidden" }
@@ -2120,7 +2162,7 @@ Panel {
     active: root.anyBusy || root.waitingOnUser
     // Red when a bot is blocked on the user, accent while bots are merely working.
     activeColor: root.waitingOnUser ? root.urgent : Color.accent
-    tooltipText: root.waitingOnUser ? "@" + root.waitingProfile + " is waiting for you"
+    tooltipText: root.waitingOnUser ? "@" + root.botLabel(root.waitingProfile) + " is waiting for you"
       : root.anyBusy ? "Hermes bots working" : "Hermes Bots"
     onPressed: function(buttonCode) { root.toggle() }
   }
@@ -2166,7 +2208,7 @@ Panel {
 
           Text {
             anchors.centerIn: parent
-            text: "Drop to attach to @" + root.selected
+            text: "Drop to attach to @" + root.botLabel(root.selected)
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -2291,7 +2333,7 @@ Panel {
                     Button {
                       required property var modelData
                       // root.revision: the status maps are mutated in place, so re-evaluate on every revision bump.
-                      text: (root.revision, (modelData.pinned ? "󰐃 " : "") + modelData.name) + (root.waitingOnUser && root.waitingProfile === modelData.name ? " ?"
+                      text: (root.revision, (modelData.pinned ? "󰐃 " : "") + (modelData.display || modelData.name)) + (root.waitingOnUser && root.waitingProfile === modelData.name ? " ?"
                         : root.busyProfiles[modelData.name] ? " …" : root.cronRunning[modelData.name] ? " ⏱"
                         : root.unreadProfiles[modelData.name] ? " •" : "")
                       selected: modelData.name === root.selected
@@ -2668,7 +2710,7 @@ Panel {
               spacing: Style.space(2)
 
               PanelSectionHeader {
-                text: "HISTORY · @" + root.selected
+                text: "HISTORY · @" + root.botLabel(root.selected)
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -3195,7 +3237,7 @@ Panel {
               spacing: Style.space(4)
 
               PanelSectionHeader {
-                text: "FILES · @" + root.selected
+                text: "FILES · @" + root.botLabel(root.selected)
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -3286,7 +3328,7 @@ Panel {
                   anchors.left: parent.left
                   anchors.right: routinesScope.left
                   anchors.verticalCenter: parent.verticalCenter
-                  text: "ROUTINES · " + (root.routinesAll ? "all bots" : "@" + root.selected)
+                  text: "ROUTINES · " + (root.routinesAll ? "all bots" : "@" + root.botLabel(root.selected))
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                 }
@@ -3309,7 +3351,7 @@ Panel {
               Text {
                 visible: root.routinesShown.length === 0
                 text: root.routinesAll ? "No routines on any bot"
-                  : root.routinesLoaded ? "No routines for @" + root.selected : "Loading routines…"
+                  : root.routinesLoaded ? "No routines for @" + root.botLabel(root.selected) : "Loading routines…"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -3460,7 +3502,7 @@ Panel {
               spacing: Style.space(4)
 
               PanelSectionHeader {
-                text: "EDIT · @" + root.selected + (root.selectedInfo ? "" : "  (loading…)")
+                text: "EDIT · @" + root.botLabel(root.selected) + (root.selectedInfo ? "" : "  (loading…)")
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -3688,7 +3730,7 @@ Panel {
                   anchors.right: sectionButton.left
                   anchors.rightMargin: Style.spacing.sm
                   anchors.verticalCenter: parent.verticalCenter
-                  placeholderText: "new section for @" + root.selected
+                  placeholderText: "new section for @" + root.botLabel(root.selected)
                   foreground: root.foreground
                   onAccepted: {
                     if (text.trim() === "") return
@@ -3768,7 +3810,7 @@ Panel {
                   anchors.right: duplicateButton.left
                   anchors.rightMargin: Style.spacing.sm
                   anchors.verticalCenter: parent.verticalCenter
-                  placeholderText: "name for a copy of @" + root.selected
+                  placeholderText: "name for a copy of @" + root.botLabel(root.selected)
                   foreground: root.foreground
                   onAccepted: root.duplicateProfile(text)
                 }
@@ -3864,9 +3906,23 @@ Panel {
                 fontFamily: root.fontFamily
               }
 
+              // Another server's default bot cannot be deleted (Hermes keeps a default bot); the server
+              // can only be taken out of the panel, and its bots keep running there.
               Button {
-                visible: root.selected !== "default"
-                text: root.armedDelete === root.selected ? "Click again to delete @" + root.selected + " for good" : "Delete @" + root.selected
+                readonly property string serverId: root.selectedProfile && root.selectedProfile.serverDefault ? root.selectedProfile.server : ""
+                visible: serverId !== ""
+                text: root.armedDelete === "server:" + serverId ? "Click again to remove " + root.botLabel(root.selected) + " from the panel"
+                  : "Remove " + root.botLabel(root.selected) + " from the panel (it keeps running)"
+                bordered: true
+                foreground: root.urgent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.requestServerRemove(serverId)
+              }
+
+              Button {
+                visible: root.selected !== "default" && !(root.selectedProfile && root.selectedProfile.serverDefault)
+                text: root.armedDelete === root.selected ? "Click again to delete @" + root.botLabel(root.selected) + " for good" : "Delete @" + root.botLabel(root.selected)
                 bordered: true
                 foreground: root.urgent
                 fontFamily: root.fontFamily
@@ -3881,7 +3937,7 @@ Panel {
               spacing: Style.space(4)
 
               PanelSectionHeader {
-                text: "MODEL · @" + root.selected
+                text: "MODEL · @" + root.botLabel(root.selected)
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -4236,7 +4292,7 @@ Panel {
             visible: root.messages.length === 0
             width: parent.width
             topPadding: Style.space(24)
-            text: "Say something to @" + root.selected
+            text: "Say something to @" + root.botLabel(root.selected)
             color: root.dim
             horizontalAlignment: Text.AlignHCenter
             font.family: root.fontFamily
@@ -4482,7 +4538,7 @@ Panel {
             Text {
               width: parent.width
               text: root.clarifyQuestion
-                ? "@" + root.waitingProfile + " asks "
+                ? "@" + root.botLabel(root.waitingProfile) + " asks "
                   + (root.clarify.questions.length > 1 ? "(" + (root.clarifyIndex + 1) + "/" + root.clarify.questions.length + ") " : "")
                   + "— "
                   + root.clarifyQuestion.question
@@ -4871,8 +4927,8 @@ Panel {
               id: input
               wrapMode: TextEdit.Wrap
               placeholderText: root.steerWorker !== "" ? "Message the worker (Enter) · press Steer again to cancel"
-                : root.busy ? "Steer @" + root.selected + " (Enter)"
-                : "Message @" + root.selected
+                : root.busy ? "Steer @" + root.botLabel(root.selected) + " (Enter)"
+                : "Message @" + root.botLabel(root.selected)
               // A bot on another server stays usable while the main server is away.
               enabled: root.connected || !!(root.selectedProfile && root.selectedProfile.server)
               color: root.foreground
