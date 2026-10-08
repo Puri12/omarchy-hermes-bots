@@ -215,6 +215,9 @@ Omarchy(Hyprland/Quickshell) 바 위젯에서 원격 [Hermes Agent](https://gith
 > [!IMPORTANT]
 > 비밀 값은 `servers.json`에 적지 말고 `envFile`에 두세요. 파일을 고친 뒤에는 `omarchy restart shell`이 필요합니다.
 
+- 봇 목록은 서버별 머리글(**SERVER**, **LAPTOP** 등 `label`) 아래로 나뉘고, 구역(SECTION)은 그 안에서 다시 묶입니다. 다른 서버의 기본 봇은 `label`(예: Laptop)로 보입니다.
+- **+ new bot**에서 `on  Server | Laptop`으로 봇을 만들 서버를 고릅니다.
+- 다른 서버의 기본 봇은 지울 수 없습니다(Hermes는 기본 프로필을 남김). 대신 Edit 맨 아래 **Remove … from the panel**을 두 번 누르면 그 서버가 `servers.json`과 목록에서 빠집니다. 그 서버의 봇은 계속 돕니다.
 - 서버가 응답하지 않으면 그 서버 봇만 목록에서 빠지고 상태줄에 `· Laptop off`가 뜹니다. 30초마다 다시 확인해 돌아오면 자동으로 다시 나타납니다.
 - 주 서버가 꺼져 있으면 상태줄에 `main server off`가 뜨고, 다른 서버의 봇은 계속 쓸 수 있습니다.
 - `servers.json`이 잘못되어 있어도 주 서버 봇은 그대로 뜨고, 패널에 오류가 표시됩니다.
@@ -377,7 +380,7 @@ omarchy-shell puri.hermes <함수> [인자…]
 | 묶음 | 함수 |
 | --- | --- |
 | 패널 | `open` `close` `toggle` `quick` `show <bot>` `state` `reconnect` `geometry` `toggleModelPicker` `editView` `showHidden <true\|false>` `contextView` `context` `artifactsView` `artifacts` `jumpPrompt <-1\|1>` |
-| 봇 | `select <bot>` `create <name> <desc>` `armDelete <name>` `deleteBot <name>` `profileGet` `profileSave <desc> <soul>` `profileDuplicate <newName>` `pin <true\|false>` `hide <true\|false>` `setModel <id>` `setEffort <level>` `effort` `section <name>` `sections` `setAvatar <path>` `clearAvatar` `avatar` `caps` `toggleCap <toolsets\|mcp\|skills> <name>` `setYolo <true\|false>` `yolo` |
+| 봇 | `select <bot>` `create <name> <desc>` `createOn <server> <name> <desc>` `newBotView` `roster` `removeServer <id>` `armDelete <name>` `deleteBot <name>` `profileGet` `profileSave <desc> <soul>` `profileDuplicate <newName>` `pin <true\|false>` `hide <true\|false>` `setModel <id>` `setEffort <level>` `effort` `section <name>` `sections` `setAvatar <path>` `clearAvatar` `avatar` `caps` `toggleCap <toolsets\|mcp\|skills> <name>` `setYolo <true\|false>` `yolo` |
 | 템플릿 | `templateExport` `lastTemplate` `templateImport <path> <name>` |
 | 대화 | `send <text>` `steer <text>` `queue <text>` `stop` `newChat` `answer <text>` `approve <once\|session\|always\|deny>` `search <text>` `quote <index>` `unread` `notices` |
 | 첨부·파일 | `attachFile <path>` `attachClipboard` `files` `openFile <name>` `dropFiles <path,path>` |
