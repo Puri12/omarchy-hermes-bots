@@ -262,9 +262,23 @@ Panel {
   // the shell for as long as a reply took.
   ListModel { id: chatModel }
   property var chatRows: []
-  onShownMessagesChanged: syncChat()
+  // Only the newest rows are built: a chat of thousands of rows took seconds to switch to, since
+  // every row is a delegate with its own Markdown. Earlier rows come on demand, a page at a time.
+  readonly property int chatPage: 80
+  property int chatLimit: chatPage
+  readonly property var chatWindow: shownMessages.length > chatLimit ? shownMessages.slice(shownMessages.length - chatLimit) : shownMessages
+  readonly property int chatHidden: shownMessages.length - chatWindow.length
+  function showEarlier() {
+    var before = chatFlick.contentHeight, top = chatFlick.contentY
+    chatFlick.following = false
+    chatLimit += 200
+    // Keep the rows that were on screen where they were: the new ones grow the chat above them.
+    Qt.callLater(function() { chatFlick.contentY = top + chatFlick.contentHeight - before })
+  }
+  onSearchTextChanged: chatLimit = chatPage
+  onChatWindowChanged: syncChat()
   function syncChat() {
-    var next = shownMessages, prev = chatRows
+    var next = chatWindow, prev = chatRows
     var head = 0
     while (head < prev.length && head < next.length && prev[head] === next[head]) head++
     var tail = 0
@@ -490,7 +504,7 @@ Panel {
   // How many of the shown rows are mine; the prompt jump buttons need two.
   readonly property int myPromptCount: {
     var n = 0
-    for (var i = 0; i < shownMessages.length; i++) if (shownMessages[i].role === "you") n++
+    for (var i = 0; i < chatWindow.length; i++) if (chatWindow[i].role === "you") n++
     return n
   }
   // Scrolls to my previous (-1) or next (1) message from the top of the view. Past the last one, the
@@ -498,8 +512,8 @@ Panel {
   function jumpPrompt(dir) {
     var top = chatFlick.contentY
     var target = -1, targetY = 0
-    for (var i = 0; i < shownMessages.length; i++) {
-      if (shownMessages[i].role !== "you") continue
+    for (var i = 0; i < chatWindow.length; i++) {
+      if (chatWindow[i].role !== "you") continue
       var row = chatRowItems.itemAt(i)
       if (!row) continue
       var y = row.y
@@ -526,6 +540,7 @@ Panel {
     if (draftOwner === "default" || profiles.some(function(p) { return p.name === draftOwner })) draftByProfile[draftOwner] = input.text
     draftOwner = selected
     closeScreen()
+    chatLimit = chatPage
     if (avatarByProfile[selected] === undefined) sendCommand({ cmd: "avatar.get", profile: selected })
     if (showingContext) sendCommand({ cmd: "context", profile: selected })
     steerWorker = ""
@@ -1239,6 +1254,8 @@ Panel {
   readonly property var artifacts: {
     revision
     var images = [], files = [], links = [], seen = {}
+    // Scanning every reply on each streamed chunk is wasted work while the view is closed.
+    if (!showingArtifacts) return { images: images, files: files, links: links }
     var linkRe = /\[([^\]\n]{1,80})\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<>()\[\]"'`]+)/g
     for (var i = messages.length - 1; i >= 0; i--) {
       var m = messages[i]
@@ -1849,7 +1866,9 @@ Panel {
         activity: root.activityLine, showingSessions: root.showingSessions,
         todos: root.selectedTodos,
         usage: root.usageByProfile[root.selected] || null,
-        messageCount: root.messages.length, last: last, transcript: root.messages.slice(-5), error: root.lastError })
+        messageCount: root.messages.length, last: last ? { role: last.role, text: String(last.text).slice(0, 2000) } : null,
+        // Rows are cut short: a huge reply made the IPC reply too big and the socket closed.
+        transcript: root.messages.slice(-5).map(function(m) { return { role: m.role, text: String(m.text).slice(0, 2000) } }), error: root.lastError })
     }
     function attachClipboard(): string { return root.attachFrom("clipboard") ? "attaching" : "busy" }
     function attachFile(path: string): string { return root.attachFrom(path) ? "attaching" : "busy" }
@@ -1933,7 +1952,7 @@ Panel {
     // Test hook: run a raw gateway frame (JSON) through the helper's event mapping.
     function injectFrame(json: string): string { root.sendCommand({ cmd: "inject", frame: JSON.parse(json) }); return "injected" }
     function quote(index: int): string {
-      root.quoteRow(root.shownMessages[index])
+      root.quoteRow(root.chatWindow[index])
       return root.quoteText
     }
     function search(text: string): string {
@@ -1993,9 +2012,13 @@ Panel {
     function yolo(): string { return root.yoloByProfile[root.selected] ? "on" : "off" }
     function artifactsView(): string { root.toggleArtifacts(); return root.showingArtifacts ? "shown" : "hidden" }
     function artifacts(): string { return JSON.stringify(root.artifacts) }
+    function showEarlier(): string {
+      root.showEarlier()
+      return JSON.stringify({ shown: root.chatWindow.length, hidden: root.chatHidden })
+    }
     function jumpPrompt(dir: int): string {
       var i = root.jumpPrompt(dir)
-      return JSON.stringify({ row: i, y: Math.round(chatFlick.contentY), text: i >= 0 ? String(root.shownMessages[i].text).slice(0, 60) : "" })
+      return JSON.stringify({ row: i, y: Math.round(chatFlick.contentY), text: i >= 0 ? String(root.chatWindow[i].text).slice(0, 60) : "" })
     }
     function dropFiles(pathsCsv: string): string {
       return String(root.attachDropped(pathsCsv.split(",").map(function(p) { return "file://" + encodeURI(p.trim()) })))
@@ -4355,6 +4378,17 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
+          }
+
+          Button {
+            visible: root.chatHidden > 0
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Show earlier messages (" + root.chatHidden + " more)"
+            bordered: true
+            foreground: root.dim
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: root.showEarlier()
           }
 
           Repeater {
