@@ -39,7 +39,7 @@ type Command =
   | { cmd: "group.stop" | "group.disband"; room: string }
   | { cmd: "group.approve"; room: string; member: string; taskId: string; generation: number; requestId: string; choice: "once" | "deny" }
   | { cmd: "group.retry"; room: string; taskId: string }
-  | { cmd: "create"; name: string; description?: string }
+  | { cmd: "create"; name: string; description?: string; server?: string }
   | { cmd: "delete"; name: string }
   | { cmd: "profile.get"; profile: string }
   | { cmd: "profile.save"; profile: string; description?: string; soul?: string }
@@ -2482,6 +2482,12 @@ class Hub {
       return;
     }
     if (c.cmd === "server.remove") return this.enqueue("", "", () => this.removeServer(c.id));
+    // A new bot is made on the server picked in the panel; the main server when none is given.
+    if (c.cmd === "create" && c.server) {
+      const target = this.extras.find((s) => s.id === c.server);
+      if (!target) return emit({ ev: "error", message: `no server named ${c.server} in the panel` });
+      return this.enqueue(target.id, target.label, () => target.remote.handle({ cmd: "create", name: c.name, description: c.description }));
+    }
     if (c.cmd === "speak.stop") {
       for (const r of [this.main, ...this.extras.map((s) => s.remote)]) void r.handle(c);
       return;

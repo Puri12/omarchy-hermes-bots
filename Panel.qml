@@ -695,6 +695,8 @@ Panel {
       serverHost = String(ev.url || "").replace(/^https?:\/\//, "")
       statusLine = (ev.mainOff ? "main server off" : "v" + ev.version + (ev.gatewayRunning ? "" : " · gateway off"))
         + (ev.servers || []).map(function(s) { return " · " + s.label + (s.ok ? "" : s.note ? " (" + s.note + ")" : " off") }).join("")
+      extraServers = (ev.servers || []).filter(function(s) { return s.ok })
+      if (createServer !== "" && !extraServers.some(function(s) { return s.id === root.createServer })) createServer = ""
       break
     case "session":
       sessionOwner[ev.session] = ev.profile
@@ -1722,10 +1724,16 @@ Panel {
     revision++
   }
 
-  function createNamed(rawName, description) {
+  // Other servers that answer (servers.json); a new bot goes to createServer, "" = the main server.
+  property var extraServers: []
+  property string createServer: ""
+  function createNamed(rawName, description, server) {
     var name = String(rawName || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-")
     if (name === "") return false
-    sendCommand({ cmd: "create", name: name, description: String(description || "").trim() })
+    var cmd = { cmd: "create", name: name, description: String(description || "").trim() }
+    var on = server === undefined ? createServer : server
+    if (on) cmd.server = on
+    sendCommand(cmd)
     return true
   }
 
@@ -1765,7 +1773,16 @@ Panel {
     function toggle(): void { root.toggle() }
     function select(name: string): string { root.selected = name; return "ok" }
     function send(text: string): string { return root.sendText(text) ? "sent" : "busy-or-empty" }
-    function create(name: string, description: string): string { return root.createNamed(name, description) ? "creating" : "invalid" }
+    function create(name: string, description: string): string { return root.createNamed(name, description, "") ? "creating" : "invalid" }
+    function newBotView(): string {
+      if (!root.creating) root.closeDrawers("create")
+      root.creating = !root.creating
+      return root.creating ? "shown" : "hidden"
+    }
+    // On another server from servers.json (its id), or "" for the main server.
+    function createOn(server: string, name: string, description: string): string {
+      return root.createNamed(name, description, server) ? "creating" : "invalid"
+    }
     function deleteBot(name: string): string {
       if (name === "default" || root.profiles.every(function(p) { return p.name !== name })) return "refused"
       root.sendCommand({ cmd: "delete", name: name })
@@ -4036,6 +4053,47 @@ Panel {
                 text: "NEW BOT"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
+              }
+
+              // Where the bot will live: the main server or another one (shown when there is one).
+              Flow {
+                visible: root.extraServers.length > 0
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Text {
+                  height: createOnMain.height
+                  verticalAlignment: Text.AlignVCenter
+                  text: "on"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Button {
+                  id: createOnMain
+                  text: "Server"
+                  selected: root.createServer === ""
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.createServer = ""
+                }
+
+                Repeater {
+                  model: root.extraServers
+                  Button {
+                    required property var modelData
+                    text: modelData.label
+                    selected: root.createServer === modelData.id
+                    bordered: true
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.createServer = modelData.id
+                  }
+                }
               }
 
               Row {
